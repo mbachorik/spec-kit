@@ -50,7 +50,6 @@ env/
 sdd-*/
 docs/dev
 specs
-!docs/superpowers/specs/
 
 
 # Extension system
