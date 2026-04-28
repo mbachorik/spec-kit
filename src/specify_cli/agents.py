@@ -634,12 +634,24 @@ class CommandRegistrar:
             content = source_file.read_text(encoding="utf-8")
             frontmatter, body = self.parse_frontmatter(content)
 
-            # Merge manifest-level fields into frontmatter — source file wins.
-            # This lets extension.yml declare behavior/description for agent files
-            # that carry no frontmatter of their own (e.g. pure persona prompts).
-            for key in ("description", "behavior", "agents"):
+            # Merge manifest-level fields into frontmatter.
+            # For scalar fields (description, agents): source file wins — only
+            # apply manifest value when source has none.
+            # For behavior: dict-merge so extension.yml can augment source
+            # behavior (e.g. add color, effort) without replacing keys the
+            # source file already declares (e.g. invocation).
+            for key in ("description", "agents"):
                 if key in cmd_info and key not in frontmatter:
                     frontmatter[key] = cmd_info[key]
+            if "behavior" in cmd_info:
+                manifest_behavior = cmd_info["behavior"]
+                if isinstance(manifest_behavior, dict):
+                    source_behavior = frontmatter.get("behavior")
+                    if isinstance(source_behavior, dict):
+                        # Manifest keys fill gaps; source keys win on conflict
+                        frontmatter["behavior"] = {**manifest_behavior, **source_behavior}
+                    else:
+                        frontmatter["behavior"] = manifest_behavior
 
             frontmatter = self._adjust_script_paths(frontmatter)
 
