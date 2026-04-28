@@ -3852,9 +3852,13 @@ def extension_update(
 
                     # Backup config files separately so they can be restored
                     # after a successful install (install_from_directory clears dest dir).
+                    # Also includes echelon.yml which harness-init writes with the harness: section.
                     config_files = list(extension_dir.glob("*-config.yml")) + list(
                         extension_dir.glob("*-config.local.yml")
                     )
+                    echelon_yml = extension_dir / "echelon.yml"
+                    if echelon_yml.exists():
+                        config_files.append(echelon_yml)
                     for cfg_file in config_files:
                         backup_config_dir.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(cfg_file, backup_config_dir / cfg_file.name)
