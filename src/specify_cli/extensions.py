@@ -1302,14 +1302,10 @@ class ExtensionManager:
                 backup_dir = self.extensions_dir / ".backup" / extension_id
                 backup_dir.mkdir(parents=True, exist_ok=True)
 
-                # Backup both primary and local override config files, plus
-                # echelon.yml which harness-init writes with the harness: section.
+                # Backup both primary and local override config files
                 config_files = list(extension_dir.glob("*-config.yml")) + list(
                     extension_dir.glob("*-config.local.yml")
                 )
-                echelon_yml = extension_dir / "echelon.yml"
-                if echelon_yml.exists():
-                    config_files.append(echelon_yml)
                 for config_file in config_files:
                     backup_path = backup_dir / config_file.name
                     shutil.copy2(config_file, backup_path)
