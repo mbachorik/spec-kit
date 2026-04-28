@@ -1302,11 +1302,12 @@ class ExtensionManager:
                 backup_dir = self.extensions_dir / ".backup" / extension_id
                 backup_dir.mkdir(parents=True, exist_ok=True)
 
-                # Backup both primary and local override config files
-                config_files = list(extension_dir.glob("*-config.yml")) + list(
-                    extension_dir.glob("*-config.local.yml")
-                )
-                for config_file in config_files:
+                # Backup all top-level .yml files except extension.yml (the manifest).
+                # This preserves user configs (*-config.yml) and any runtime-generated
+                # state files that extensions write to their own directory.
+                for config_file in extension_dir.glob("*.yml"):
+                    if config_file.name == "extension.yml":
+                        continue
                     backup_path = backup_dir / config_file.name
                     shutil.copy2(config_file, backup_path)
 
