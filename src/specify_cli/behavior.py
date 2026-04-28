@@ -81,9 +81,29 @@ _TRANSLATIONS: dict[str, dict[str, dict[str, tuple[str | None, object]]]] = {
     },
     "copilot": {
         "execution": {
-            "agent": ("mode", "agent"),
-            "isolated": ("mode", "agent"),
+            "agent": (None, None),    # routing concern only; no Copilot frontmatter equivalent
+            "isolated": (None, None), # no fork/isolation concept in Copilot
             "command": (None, None),
+        },
+        "capability": {
+            "fast": ("model", "Claude Haiku 4.5"),
+            "balanced": ("model", "Claude Sonnet 4.5"),
+            "strong": ("model", "Claude Opus 4.5"),
+        },
+        "invocation": {
+            "explicit": ("disable-model-invocation", True),
+            "automatic": ("disable-model-invocation", False),
+        },
+        "visibility": {
+            "user": ("user-invocable", True),
+            "model": ("user-invocable", False),
+            "both": (None, None),
+        },
+        "tools": {
+            "none": ("tools", []),
+            "read-only": ("tools", ["read_file", "list_directory", "search_files"]),
+            "write": ("tools", ["*"]),
+            "full": ("tools", ["*"]),
         },
     },
     "codex": {

@@ -49,9 +49,57 @@ class TestTranslateBehavior:
         result = translate_behavior("claude", {"visibility": "model"})
         assert result == {"user-invocable": False}
 
-    def test_execution_agent_copilot(self):
+    def test_execution_agent_copilot_no_frontmatter(self):
         result = translate_behavior("copilot", {"execution": "agent"})
-        assert result == {"mode": "agent"}
+        assert result == {}
+
+    def test_execution_isolated_copilot_no_frontmatter(self):
+        result = translate_behavior("copilot", {"execution": "isolated"})
+        assert result == {}
+
+    def test_capability_fast_copilot(self):
+        result = translate_behavior("copilot", {"capability": "fast"})
+        assert result == {"model": "Claude Haiku 4.5"}
+
+    def test_capability_balanced_copilot(self):
+        result = translate_behavior("copilot", {"capability": "balanced"})
+        assert result == {"model": "Claude Sonnet 4.5"}
+
+    def test_capability_strong_copilot(self):
+        result = translate_behavior("copilot", {"capability": "strong"})
+        assert result == {"model": "Claude Opus 4.5"}
+
+    def test_invocation_explicit_copilot(self):
+        result = translate_behavior("copilot", {"invocation": "explicit"})
+        assert result == {"disable-model-invocation": True}
+
+    def test_invocation_automatic_copilot(self):
+        result = translate_behavior("copilot", {"invocation": "automatic"})
+        assert result == {"disable-model-invocation": False}
+
+    def test_visibility_user_copilot(self):
+        result = translate_behavior("copilot", {"visibility": "user"})
+        assert result == {"user-invocable": True}
+
+    def test_visibility_model_copilot(self):
+        result = translate_behavior("copilot", {"visibility": "model"})
+        assert result == {"user-invocable": False}
+
+    def test_tools_none_copilot(self):
+        result = translate_behavior("copilot", {"tools": "none"})
+        assert result == {"tools": []}
+
+    def test_tools_read_only_copilot(self):
+        result = translate_behavior("copilot", {"tools": "read-only"})
+        assert result == {"tools": ["read_file", "list_directory", "search_files"]}
+
+    def test_tools_write_copilot(self):
+        result = translate_behavior("copilot", {"tools": "write"})
+        assert result == {"tools": ["*"]}
+
+    def test_tools_full_copilot(self):
+        result = translate_behavior("copilot", {"tools": "full"})
+        assert result == {"tools": ["*"]}
 
     def test_tools_write_claude(self):
         result = translate_behavior("claude", {"tools": "write"})

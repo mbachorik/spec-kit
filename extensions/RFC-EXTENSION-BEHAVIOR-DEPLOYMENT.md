@@ -28,22 +28,22 @@ behavior:
 
 | behavior field | value | Claude | Copilot | Codex | Others |
 |---|---|---|---|---|---|
-| `execution` | `isolated` | `context: fork` | `mode: agent` | — | — |
-| `execution` | `agent` | routing only (see Deployment section) | `mode: agent` | — | — |
-| `capability` | `fast` | `model: claude-haiku-4-5-20251001` | — | — | — |
-| `capability` | `balanced` | `model: claude-sonnet-4-6` | — | — | — |
-| `capability` | `strong` | `model: claude-opus-4-6` | — | — | — |
+| `execution` | `isolated` | `context: fork` | — | — | — |
+| `execution` | `agent` | routing only (see Deployment section) | — | — | — |
+| `capability` | `fast` | `model: claude-haiku-4-5-20251001` | `model: Claude Haiku 4.5` | — | — |
+| `capability` | `balanced` | `model: claude-sonnet-4-6` | `model: Claude Sonnet 4.5` | — | — |
+| `capability` | `strong` | `model: claude-opus-4-6` | `model: Claude Opus 4.5` | — | — |
 | `effort` | any | `effort: {value}` | — | `effort: {value}` | — |
 | `tools` | `read-only` | `allowed-tools: Read Grep Glob` | `tools: [read_file, list_directory, search_files]` | — | — |
-| `tools` | `write` | `allowed-tools: Read Write Edit Grep Glob` | — | — | — |
-| `tools` | `none` | `allowed-tools: ""` | — | — | — |
-| `tools` | `full` | — (no restriction, all tools available) | — | — | — |
+| `tools` | `write` | `allowed-tools: Read Write Edit Grep Glob` | `tools: ["*"]` | — | — |
+| `tools` | `none` | `allowed-tools: ""` | `tools: []` | — | — |
+| `tools` | `full` | — (no restriction, all tools available) | `tools: ["*"]` | — | — |
 | `tools` | `<custom string>` | `allowed-tools: <value>` (literal passthrough) | — | — | — |
 | `tools` | `<yaml list>` | `allowed-tools: <space-joined items>` | — | — | — |
-| `invocation` | `explicit` | `disable-model-invocation: true` | — | — | — |
-| `invocation` | `automatic` | `disable-model-invocation: false` | — | — | — |
-| `visibility` | `user` | `user-invocable: true` | — | — | — |
-| `visibility` | `model` | `user-invocable: false` | — | — | — |
+| `invocation` | `explicit` | `disable-model-invocation: true` | `disable-model-invocation: true` | — | — |
+| `invocation` | `automatic` | `disable-model-invocation: false` | `disable-model-invocation: false` | — | — |
+| `visibility` | `user` | `user-invocable: true` | `user-invocable: true` | — | — |
+| `visibility` | `model` | `user-invocable: false` | `user-invocable: false` | — | — |
 | `visibility` | `both` | — | — | — | — |
 | `color` | any valid value | `color: {value}` | — | — | — |
 
