@@ -1708,6 +1708,127 @@ $ARGUMENTS
         assert ".specify/extensions/test-ext/templates/spec.md" in rewritten
         assert ".specify/scripts/bash/setup-plan.sh" in rewritten
 
+    def test_register_commands_rewrites_extension_relative_body_paths(self, project_dir, temp_dir):
+        """Extension-owned body paths should point at installed extension assets."""
+        import yaml
+
+        ext_dir = temp_dir / "asset-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "agents" / "control").mkdir(parents=True)
+        (ext_dir / "knowledge-base").mkdir()
+        (ext_dir / "agents" / "control" / "commander.md").write_text("agent", encoding="utf-8")
+        (ext_dir / "knowledge-base" / "scores.yaml").write_text("scores: []", encoding="utf-8")
+        (ext_dir / "commands" / "run.md").write_text(
+            "---\n"
+            "description: Run asset command\n"
+            "---\n\n"
+            "Read agents/control/commander.md.\n"
+            "Load knowledge-base/scores.yaml.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "asset-ext",
+                        "name": "Asset Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.asset-ext.run",
+                                "file": "commands/run.md",
+                                "description": "Run asset command",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = ExtensionManifest(ext_dir / "extension.yml")
+        registrar = CommandRegistrar()
+        registrar.register_commands_for_agent("claude", manifest, ext_dir, project_dir)
+
+        content = (project_dir / ".claude" / "skills" / "speckit-asset-ext-run" / "SKILL.md").read_text(encoding="utf-8")
+        assert ".specify/extensions/asset-ext/agents/control/commander.md" in content
+        assert ".specify/extensions/asset-ext/knowledge-base/scores.yaml" in content
+        assert "Read agents/control/commander.md" not in content
+        assert "Load knowledge-base/scores.yaml" not in content
+
+    def test_register_commands_routes_claude_behavior_agent_to_agents_dir(
+        self, project_dir, temp_dir
+    ):
+        """Claude commands with behavior.execution=agent should become agent definitions."""
+        import yaml
+
+        ext_dir = temp_dir / "agent-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "commands" / "review.md").write_text(
+            "---\n"
+            "description: Review as an agent\n"
+            "behavior:\n"
+            "  execution: agent\n"
+            "  tools: read-only\n"
+            "agents:\n"
+            "  claude:\n"
+            "    model: claude-opus-test\n"
+            "---\n\n"
+            "Act as the review agent.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "agent-ext",
+                        "name": "Agent Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.agent-ext.review",
+                                "file": "commands/review.md",
+                                "description": "Review as an agent",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = ExtensionManifest(ext_dir / "extension.yml")
+        registrar = CommandRegistrar()
+        registrar.register_commands_for_agent("claude", manifest, ext_dir, project_dir)
+
+        agent_file = project_dir / ".claude" / "agents" / "speckit-agent-ext-review.md"
+        skill_file = project_dir / ".claude" / "skills" / "speckit-agent-ext-review" / "SKILL.md"
+        assert agent_file.exists()
+        assert not skill_file.exists()
+        content = agent_file.read_text(encoding="utf-8")
+        frontmatter = yaml.safe_load(content.split("---", 2)[1])
+        assert frontmatter["name"] == "speckit-agent-ext-review"
+        assert frontmatter["description"] == "Review as an agent"
+        assert frontmatter["tools"] == "Read Grep Glob"
+        assert frontmatter["model"] == "claude-opus-test"
+        assert "disable-model-invocation" not in frontmatter
+        assert "user-invocable" not in frontmatter
+        assert "Act as the review agent." in content
+
     def test_render_toml_command_handles_embedded_triple_double_quotes(self):
         """TOML renderer should stay valid when body includes triple double-quotes."""
         from specify_cli.agents import CommandRegistrar as AgentCommandRegistrar

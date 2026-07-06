@@ -347,6 +347,171 @@ class TestExtensionSkillRegistration:
         assert "description" in parsed
         assert parsed["disable-model-invocation"] is False
 
+    def test_register_extension_skills_rewrites_extension_relative_body_paths(
+        self, skills_project, temp_dir
+    ):
+        """Direct extension skill registration should rewrite extension-owned paths."""
+        project_dir, skills_dir = skills_project
+        ext_dir = temp_dir / "asset-skill-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "agents" / "control").mkdir(parents=True)
+        (ext_dir / "knowledge-base").mkdir()
+        (ext_dir / "agents" / "control" / "commander.md").write_text("agent", encoding="utf-8")
+        (ext_dir / "knowledge-base" / "scores.yaml").write_text("scores: []", encoding="utf-8")
+        (ext_dir / "commands" / "run.md").write_text(
+            "---\n"
+            "description: Run asset skill\n"
+            "---\n\n"
+            "Read agents/control/commander.md.\n"
+            "Load knowledge-base/scores.yaml.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "asset-skill-ext",
+                        "name": "Asset Skill Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.asset-skill-ext.run",
+                                "file": "commands/run.md",
+                                "description": "Run asset skill",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        content = (skills_dir / "speckit-asset-skill-ext-run" / "SKILL.md").read_text(encoding="utf-8")
+        assert ".specify/extensions/asset-skill-ext/agents/control/commander.md" in content
+        assert ".specify/extensions/asset-skill-ext/knowledge-base/scores.yaml" in content
+        assert "Read agents/control/commander.md" not in content
+        assert "Load knowledge-base/scores.yaml" not in content
+
+    def test_register_extension_skills_translates_claude_behavior_frontmatter(
+        self, skills_project, temp_dir
+    ):
+        """Neutral behavior frontmatter should control generated Claude skill metadata."""
+        project_dir, skills_dir = skills_project
+        ext_dir = temp_dir / "behavior-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "commands" / "review.md").write_text(
+            "---\n"
+            "description: Review with constrained tools\n"
+            "behavior:\n"
+            "  tools: read-only\n"
+            "  invocation: explicit\n"
+            "  visibility: model\n"
+            "agents:\n"
+            "  claude:\n"
+            "    model: claude-opus-test\n"
+            "---\n\n"
+            "Review the implementation.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "behavior-ext",
+                        "name": "Behavior Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.behavior-ext.review",
+                                "file": "commands/review.md",
+                                "description": "Review with constrained tools",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        content = (skills_dir / "speckit-behavior-ext-review" / "SKILL.md").read_text(encoding="utf-8")
+        frontmatter = yaml.safe_load(content.split("---", 2)[1])
+        assert frontmatter["allowed-tools"] == "Read Grep Glob"
+        assert frontmatter["disable-model-invocation"] is True
+        assert frontmatter["user-invocable"] is False
+        assert frontmatter["model"] == "claude-opus-test"
+        assert "behavior" not in frontmatter
+        assert "agents" not in frontmatter
+
+    def test_install_skips_direct_skill_for_claude_agent_deployment(
+        self, skills_project, temp_dir
+    ):
+        """Agent-deployed extension commands should not also create SKILL.md files."""
+        project_dir, skills_dir = skills_project
+        ext_dir = temp_dir / "agent-deploy-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "commands" / "review.md").write_text(
+            "---\n"
+            "description: Review as an agent\n"
+            "behavior:\n"
+            "  execution: agent\n"
+            "  tools: read-only\n"
+            "---\n\n"
+            "Review from an agent definition.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "agent-deploy-ext",
+                        "name": "Agent Deploy Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.agent-deploy-ext.review",
+                                "file": "commands/review.md",
+                                "description": "Review as an agent",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=True)
+
+        assert (project_dir / ".claude" / "agents" / "speckit-agent-deploy-ext-review.md").exists()
+        assert not (skills_dir / "speckit-agent-deploy-ext-review" / "SKILL.md").exists()
+
     def test_argument_hint_preserved_for_extension_command(
         self, skills_project, temp_dir
     ):

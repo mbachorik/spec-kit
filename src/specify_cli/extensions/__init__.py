@@ -30,6 +30,7 @@ from .._assets import _locate_core_pack, _repo_root
 from .._init_options import is_ai_skills_enabled
 from .._invocation_style import is_dollar_skills_agent, is_slash_skills_agent
 from .._utils import dump_frontmatter, relative_extension_path_violation, version_satisfies
+from ..behavior import get_deployment_type
 from ..catalogs import CatalogEntry as BaseCatalogEntry
 from ..catalogs import CatalogStackBase
 from ..shared_infra import verify_archive_sha256
@@ -1035,6 +1036,14 @@ class ExtensionManager:
             if not source_file.is_file():
                 continue
 
+            try:
+                content = source_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            frontmatter, body = registrar.parse_frontmatter(content)
+            if selected_ai == "claude" and get_deployment_type(frontmatter) == "agent":
+                continue
+
             # Derive skill name from command name using the same hyphenated
             # convention as hook rendering and preset skill registration.
             short_name_raw = cmd_name
@@ -1059,22 +1068,10 @@ class ExtensionManager:
                 if not is_expected_dev_symlink:
                     continue
 
-            # Create skill directory; track whether we created it so we can clean
-            # up safely if reading the source file subsequently fails.
-            created_now = not skill_subdir.exists()
+            # Create skill directory after source parsing and deployment checks.
             skill_subdir.mkdir(parents=True, exist_ok=True)
 
-            # Parse the command file — guard against IsADirectoryError / decode errors
-            try:
-                content = source_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                if created_now:
-                    try:
-                        skill_subdir.rmdir()  # undo the mkdir; dir is empty at this point
-                    except OSError:
-                        pass  # best-effort cleanup
-                continue
-            frontmatter, body = registrar.parse_frontmatter(content)
+            body = registrar.rewrite_extension_paths(body, manifest.id, extension_dir)
             frontmatter = registrar._adjust_script_paths(frontmatter)
             body = registrar.resolve_skill_placeholders(
                 selected_ai, frontmatter, body, self.project_root
@@ -1088,6 +1085,7 @@ class ExtensionManager:
                 skill_name,
                 description,
                 f"extension:{manifest.id}",
+                source_frontmatter=frontmatter,
             )
             # Preserve the command's argument-hint in the generated skill,
             # mirroring the core template path (ClaudeIntegration.setup injects

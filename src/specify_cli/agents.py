@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from .behavior import get_deployment_type, strip_behavior_keys, translate_behavior
 from ._init_options import is_ai_skills_enabled, load_init_options
 from ._utils import relative_extension_path_violation
 
@@ -196,6 +197,35 @@ class CommandRegistrar:
             ".specify.specify/", ".specify/"
         )
 
+    @staticmethod
+    def rewrite_extension_paths(text: str, extension_id: str, extension_dir: Path) -> str:
+        """Rewrite extension-relative body paths to installed extension locations."""
+        if not isinstance(text, str) or not text:
+            return text
+
+        try:
+            subdirs = [
+                d.name
+                for d in extension_dir.iterdir()
+                if d.is_dir()
+                and d.name not in {"commands", ".git", "specs"}
+                and not d.name.startswith(".")
+            ]
+        except OSError:
+            return text
+
+        base_prefix = f".specify/extensions/{extension_id}/"
+        text = text.replace("$EXTENSION_PATH", base_prefix.rstrip("/"))
+
+        for subdir in subdirs:
+            text = re.sub(
+                r"(^|[\s`\"'(])(?:\.?/)?" + re.escape(subdir) + r"/",
+                r"\1" + base_prefix + subdir + "/",
+                text,
+            )
+
+        return text
+
     def render_markdown_command(
         self, frontmatter: dict, body: str, source_id: str, context_note: str = None
     ) -> str:
@@ -303,6 +333,49 @@ class CommandRegistrar:
             description = str(description) if description is not None else ""
         return YamlIntegration._render_yaml(title, description, body, source_id)
 
+    def render_agent_definition(
+        self,
+        agent_name: str,
+        agent_name_on_disk: str,
+        frontmatter: dict,
+        body: str,
+    ) -> str:
+        """Render a command body as a Claude agent definition."""
+        if not isinstance(frontmatter, dict):
+            frontmatter = {}
+
+        behavior = frontmatter.get("behavior")
+        behavior_fields = translate_behavior(
+            agent_name,
+            behavior if isinstance(behavior, dict) else {},
+            frontmatter.get("agents"),
+        )
+        clean_frontmatter = strip_behavior_keys(frontmatter)
+        description = clean_frontmatter.get(
+            "description", f"Spec-kit agent: {agent_name_on_disk}"
+        )
+
+        agent_frontmatter: dict[str, Any] = {
+            "name": agent_name_on_disk,
+            "description": description,
+        }
+        for key, value in behavior_fields.items():
+            if key == "allowed-tools":
+                agent_frontmatter["tools"] = value
+            elif key not in {
+                "disable-model-invocation",
+                "user-invocable",
+                "context",
+                "agent",
+            }:
+                agent_frontmatter[key] = value
+
+        for key in ("model", "tools", "color"):
+            if key in clean_frontmatter:
+                agent_frontmatter[key] = clean_frontmatter[key]
+
+        return self.render_frontmatter(agent_frontmatter) + "\n" + body
+
     def render_skill_command(
         self,
         agent_name: str,
@@ -342,6 +415,7 @@ class CommandRegistrar:
             skill_name,
             description,
             f"{source_id}:{source_file}",
+            source_frontmatter=frontmatter,
         )
         return self.render_frontmatter(skill_frontmatter) + "\n" + body
 
@@ -351,6 +425,7 @@ class CommandRegistrar:
         skill_name: str,
         description: str,
         source: str,
+        source_frontmatter: dict | None = None,
     ) -> dict:
         """Build consistent SKILL.md frontmatter across all skill generators."""
         skill_frontmatter = {
@@ -362,6 +437,28 @@ class CommandRegistrar:
                 "source": source,
             },
         }
+        if isinstance(source_frontmatter, dict):
+            clean_frontmatter = strip_behavior_keys(source_frontmatter)
+            behavior = source_frontmatter.get("behavior")
+            behavior_fields = translate_behavior(
+                agent_name,
+                behavior if isinstance(behavior, dict) else {},
+                source_frontmatter.get("agents"),
+            )
+            skill_frontmatter.update(behavior_fields)
+            for key in (
+                "model",
+                "effort",
+                "context",
+                "agent",
+                "allowed-tools",
+                "tools",
+                "user-invocable",
+                "disable-model-invocation",
+                "color",
+            ):
+                if key in clean_frontmatter:
+                    skill_frontmatter[key] = clean_frontmatter[key]
         return skill_frontmatter
 
     @staticmethod
@@ -614,6 +711,9 @@ class CommandRegistrar:
                         frontmatter[key] = core_frontmatter[key]
                 frontmatter.pop("strategy", None)
 
+            if (source_dir / "extension.yml").is_file():
+                body = self.rewrite_extension_paths(body, source_id, source_dir)
+
             frontmatter = self._adjust_script_paths(frontmatter)
 
             for key in agent_config.get("strip_frontmatter_keys", []):
@@ -643,6 +743,39 @@ class CommandRegistrar:
             body = IntegrationBase.resolve_command_refs(body, _sep)
 
             output_name = self._compute_output_name(agent_name, cmd_name, agent_config)
+
+            if agent_name == "claude" and get_deployment_type(frontmatter) == "agent":
+                output = self.render_agent_definition(
+                    agent_name,
+                    output_name,
+                    frontmatter,
+                    body,
+                )
+                agents_dir = project_root / ".claude" / "agents"
+                dest_file = agents_dir / f"{output_name}.md"
+                self._ensure_inside(dest_file, agents_dir)
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_file.write_text(output, encoding="utf-8")
+                registered.append(cmd_name)
+
+                for alias in aliases:
+                    alias_output_name = self._compute_output_name(
+                        agent_name, alias, agent_config
+                    )
+                    alias_frontmatter = deepcopy(frontmatter)
+                    alias_frontmatter["name"] = alias_output_name
+                    alias_output = self.render_agent_definition(
+                        agent_name,
+                        alias_output_name,
+                        alias_frontmatter,
+                        body,
+                    )
+                    alias_file = agents_dir / f"{alias_output_name}.md"
+                    self._ensure_inside(alias_file, agents_dir)
+                    alias_file.parent.mkdir(parents=True, exist_ok=True)
+                    alias_file.write_text(alias_output, encoding="utf-8")
+                    registered.append(alias)
+                continue
 
             if agent_config["extension"] == "/SKILL.md":
                 output = self.render_skill_command(
