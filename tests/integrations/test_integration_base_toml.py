@@ -1,8 +1,8 @@
 """Reusable test mixin for standard TomlIntegration subclasses.
 
 Each per-agent test file sets ``KEY``, ``FOLDER``, ``COMMANDS_SUBDIR``,
-``REGISTRAR_DIR``, and ``CONTEXT_FILE``, then inherits all verification
-logic from ``TomlIntegrationTests``.
+and ``REGISTRAR_DIR``, then inherits all verification logic from
+``TomlIntegrationTests``.
 
 Mirrors ``MarkdownIntegrationTests`` closely — same test structure,
 adapted for TOML output format.
@@ -27,14 +27,12 @@ class TomlIntegrationTests:
         FOLDER: str           — e.g. ".gemini/"
         COMMANDS_SUBDIR: str  — e.g. "commands"
         REGISTRAR_DIR: str    — e.g. ".gemini/commands"
-        CONTEXT_FILE: str     — e.g. "GEMINI.md"
     """
 
     KEY: str
     FOLDER: str
     COMMANDS_SUBDIR: str
     REGISTRAR_DIR: str
-    CONTEXT_FILE: str
 
     # -- Registration -----------------------------------------------------
 
@@ -61,10 +59,6 @@ class TomlIntegrationTests:
         assert i.registrar_config["format"] == "toml"
         assert i.registrar_config["args"] == "{{args}}"
         assert i.registrar_config["extension"] == ".toml"
-
-    def test_context_file(self):
-        i = get_integration(self.KEY)
-        assert i.context_file == self.CONTEXT_FILE
 
     # -- Setup / teardown -------------------------------------------------
 
@@ -106,6 +100,7 @@ class TomlIntegrationTests:
             assert "{SCRIPT}" not in content, f"{f.name} has unprocessed {{SCRIPT}}"
             assert "__AGENT__" not in content, f"{f.name} has unprocessed __AGENT__"
             assert "{ARGS}" not in content, f"{f.name} has unprocessed {{ARGS}}"
+            assert "__SPECKIT_COMMAND_" not in content, f"{f.name} has unprocessed __SPECKIT_COMMAND_*__"
 
     def test_toml_has_description(self, tmp_path):
         """Every TOML command file should have a description key."""
@@ -310,6 +305,22 @@ class TomlIntegrationTests:
                 raise AssertionError(f"{f.name} is not valid TOML: {exc}") from exc
             assert "prompt" in parsed, f"{f.name} parsed TOML has no 'prompt' key"
 
+    def test_plan_command_has_no_context_placeholder(self, tmp_path):
+        """The generated plan command must not carry a context-file placeholder.
+
+        Agent context files are owned entirely by the opt-in agent-context
+        extension, so the core plan command must not reference one.
+        """
+        i = get_integration(self.KEY)
+        m = IntegrationManifest(self.KEY, tmp_path)
+        i.setup(tmp_path, m)
+        plan_file = i.commands_dest(tmp_path) / i.command_filename("plan")
+        assert plan_file.exists(), f"Plan file {plan_file} not created"
+        content = plan_file.read_text(encoding="utf-8")
+        assert "__CONTEXT_FILE__" not in content, (
+            f"Plan command has unprocessed __CONTEXT_FILE__ placeholder in {plan_file.name}"
+        )
+
     def test_all_files_tracked_in_manifest(self, tmp_path):
         i = get_integration(self.KEY)
         m = IntegrationManifest(self.KEY, tmp_path)
@@ -341,41 +352,36 @@ class TomlIntegrationTests:
         assert modified_file.exists()
         assert modified_file in skipped
 
-    # -- Scripts ----------------------------------------------------------
+    # -- Context file ownership (extension-owned, opt-in) -----------------
 
-    def test_setup_installs_update_context_scripts(self, tmp_path):
-        i = get_integration(self.KEY)
-        m = IntegrationManifest(self.KEY, tmp_path)
-        created = i.setup(tmp_path, m)
-        scripts_dir = tmp_path / ".specify" / "integrations" / self.KEY / "scripts"
-        assert scripts_dir.is_dir(), f"Scripts directory not created for {self.KEY}"
-        assert (scripts_dir / "update-context.sh").exists()
-        assert (scripts_dir / "update-context.ps1").exists()
-
-    def test_scripts_tracked_in_manifest(self, tmp_path):
+    def test_setup_does_not_write_context_section(self, tmp_path):
+        """Setup must not create or manage any agent context file — that is
+        owned entirely by the opt-in agent-context extension."""
         i = get_integration(self.KEY)
         m = IntegrationManifest(self.KEY, tmp_path)
         i.setup(tmp_path, m)
-        script_rels = [k for k in m.files if "update-context" in k]
-        assert len(script_rels) >= 2
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                assert "<!-- SPECKIT START -->" not in text, (
+                    f"Setup wrote a managed context section into {path} for {self.KEY}"
+                )
 
-    def test_sh_script_is_executable(self, tmp_path):
+    def test_teardown_leaves_existing_context_file_intact(self, tmp_path):
+        """A user-authored context file must survive setup + teardown untouched."""
         i = get_integration(self.KEY)
         m = IntegrationManifest(self.KEY, tmp_path)
+        ctx_path = tmp_path / "AGENTS.md"
+        original = "# My Rules\n\nUser content.\n"
+        ctx_path.write_text(original, encoding="utf-8")
         i.setup(tmp_path, m)
-        sh = (
-            tmp_path
-            / ".specify"
-            / "integrations"
-            / self.KEY
-            / "scripts"
-            / "update-context.sh"
-        )
-        assert os.access(sh, os.X_OK)
+        m.save()
+        i.teardown(tmp_path, m)
+        assert ctx_path.read_text(encoding="utf-8") == original
 
-    # -- CLI auto-promote -------------------------------------------------
+    # -- CLI integration flag -------------------------------------------------
 
-    def test_ai_flag_auto_promotes(self, tmp_path):
+    def test_integration_flag_auto_promotes(self, tmp_path):
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -390,21 +396,20 @@ class TomlIntegrationTests:
                 [
                     "init",
                     "--here",
-                    "--ai",
+                    "--integration",
                     self.KEY,
                     "--script",
                     "sh",
-                    "--no-git",
                     "--ignore-agent-tools",
                 ],
                 catch_exceptions=False,
             )
         finally:
             os.chdir(old_cwd)
-        assert result.exit_code == 0, f"init --ai {self.KEY} failed: {result.output}"
+        assert result.exit_code == 0, f"init --integration {self.KEY} failed: {result.output}"
         i = get_integration(self.KEY)
         cmd_dir = i.commands_dest(project)
-        assert cmd_dir.is_dir(), f"--ai {self.KEY} did not create commands directory"
+        assert cmd_dir.is_dir(), f"--integration {self.KEY} did not create commands directory"
 
     def test_integration_flag_creates_files(self, tmp_path):
         from typer.testing import CliRunner
@@ -425,7 +430,6 @@ class TomlIntegrationTests:
                     self.KEY,
                     "--script",
                     "sh",
-                    "--no-git",
                     "--ignore-agent-tools",
                 ],
                 catch_exceptions=False,
@@ -441,15 +445,17 @@ class TomlIntegrationTests:
         commands = sorted(cmd_dir.glob("speckit.*.toml"))
         assert len(commands) > 0, f"No command files in {cmd_dir}"
 
+
     # -- Complete file inventory ------------------------------------------
 
     COMMAND_STEMS = [
         "analyze",
-        "checklist",
         "clarify",
         "constitution",
+        "converge",
         "implement",
         "plan",
+        "checklist",
         "specify",
         "tasks",
         "taskstoissues",
@@ -465,10 +471,6 @@ class TomlIntegrationTests:
         for stem in self.COMMAND_STEMS:
             files.append(f"{cmd_dir}/speckit.{stem}.toml")
 
-        # Integration scripts
-        files.append(f".specify/integrations/{self.KEY}/scripts/update-context.ps1")
-        files.append(f".specify/integrations/{self.KEY}/scripts/update-context.sh")
-
         # Framework files
         files.append(".specify/integration.json")
         files.append(".specify/init-options.json")
@@ -481,7 +483,7 @@ class TomlIntegrationTests:
                 "common.sh",
                 "create-new-feature.sh",
                 "setup-plan.sh",
-                "update-agent-context.sh",
+                "setup-tasks.sh",
             ]:
                 files.append(f".specify/scripts/bash/{name}")
         else:
@@ -490,12 +492,11 @@ class TomlIntegrationTests:
                 "common.ps1",
                 "create-new-feature.ps1",
                 "setup-plan.ps1",
-                "update-agent-context.ps1",
+                "setup-tasks.ps1",
             ]:
                 files.append(f".specify/scripts/powershell/{name}")
 
         for name in [
-            "agent-file-template.md",
             "checklist-template.md",
             "constitution-template.md",
             "plan-template.md",
@@ -508,6 +509,9 @@ class TomlIntegrationTests:
         # Bundled workflow
         files.append(".specify/workflows/speckit/workflow.yml")
         files.append(".specify/workflows/workflow-registry.json")
+
+
+
         return sorted(files)
 
     def test_complete_file_inventory_sh(self, tmp_path):
@@ -529,7 +533,6 @@ class TomlIntegrationTests:
                     self.KEY,
                     "--script",
                     "sh",
-                    "--no-git",
                     "--ignore-agent-tools",
                 ],
                 catch_exceptions=False,
@@ -538,7 +541,7 @@ class TomlIntegrationTests:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(
-            p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file()
+            p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file() and ".git" not in p.parts
         )
         expected = self._expected_files("sh")
         assert actual == expected, (
@@ -565,7 +568,6 @@ class TomlIntegrationTests:
                     self.KEY,
                     "--script",
                     "ps",
-                    "--no-git",
                     "--ignore-agent-tools",
                 ],
                 catch_exceptions=False,
@@ -574,7 +576,7 @@ class TomlIntegrationTests:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(
-            p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file()
+            p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file() and ".git" not in p.parts
         )
         expected = self._expected_files("ps")
         assert actual == expected, (

@@ -11,7 +11,7 @@ steps:
   - id: specify
     command: speckit.specify
     input:
-      args: "{{ inputs.feature_name }}"
+      args: "{{ inputs.spec }}"
 
   - id: review
     type: gate
@@ -35,10 +35,10 @@ specify workflow search
 specify workflow add speckit
 
 # Or run directly from a local YAML file
-specify workflow run ./workflow.yml --input feature_name="user-auth"
+specify workflow run ./workflow.yml --input spec="Build a user authentication system with OAuth support"
 
 # Run an installed workflow with inputs
-specify workflow run speckit --input feature_name="user-auth"
+specify workflow run speckit --input spec="Build a user authentication system with OAuth support"
 
 # Check run status
 specify workflow status
@@ -59,26 +59,26 @@ specify workflow remove speckit
 
 ```bash
 specify workflow add speckit
-specify workflow run speckit --input feature_name="user-auth"
+specify workflow run speckit --input spec="Build a user authentication system with OAuth support"
 ```
 
 ### From a Local YAML File
 
 ```bash
-specify workflow run ./my-workflow.yml --input feature_name="user-auth"
+specify workflow run ./my-workflow.yml --input spec="Build a user authentication system with OAuth support"
 ```
 
 ### Multiple Inputs
 
 ```bash
 specify workflow run speckit \
-  --input feature_name="user-auth" \
+  --input spec="Build a user authentication system with OAuth support" \
   --input scope="backend-only"
 ```
 
 ## Step Types
 
-Workflows support 10 built-in step types:
+Workflows support 11 built-in step types:
 
 ### Command Steps (default)
 
@@ -88,7 +88,7 @@ Invoke an installed Spec Kit command by name via the integration CLI:
 - id: specify
   command: speckit.specify
   input:
-    args: "{{ inputs.feature_name }}"
+    args: "{{ inputs.spec }}"
   integration: claude        # Optional: override workflow default
   model: "claude-sonnet-4-20250514"   # Optional: override model
 ```
@@ -112,6 +112,24 @@ Run a shell command and capture output:
 - id: run-tests
   type: shell
   run: "cd {{ inputs.project_dir }} && npm test"
+```
+
+### Init Steps
+
+Bootstrap a project the same way `specify init` does — scaffolding
+templates, scripts, shared infrastructure, and the selected coding agent
+integration. Runs non-interactively (defaults to `--ignore-agent-tools`)
+and resolves the integration from the step config or the workflow default:
+
+```yaml
+- id: bootstrap
+  type: init
+  here: true                 # or: project: my-project
+  integration: copilot       # Optional: defaults to workflow integration
+  integration_options: "--skills"  # Optional: extra options for the integration
+  script: sh                 # Optional: sh or ps
+  force: true                # Optional: required when target directory already exists
+  preset: healthcare-compliance   # Optional preset ID
 ```
 
 ### Gate Steps
@@ -219,13 +237,90 @@ Aggregate results from fan-out steps:
   output: {}
 ```
 
+## Error Handling
+
+By default, any step that returns `StepResult(status=StepStatus.FAILED, ...)`
+at runtime halts the entire run — most commonly a `shell` or
+`command` step exiting non-zero. Set `continue_on_error: true` on
+a step to record its result and continue to the next sibling step
+instead. When the failure was a non-zero exit, the exit code
+remains available on `steps.<id>.output.exit_code` so a downstream
+`if` or `switch` can branch on it (or a `gate` can surface it to
+the operator via `{{ }}` interpolation in `message`):
+
+```yaml
+- id: heavy-thing
+  type: command
+  integration: claude
+  command: speckit.heavy-thing
+  continue_on_error: true
+
+- id: check-result
+  type: if
+  condition: "{{ steps.heavy-thing.output.exit_code != 0 }}"
+  then:
+    - id: review
+      type: gate
+      message: "Step failed (exit {{ steps.heavy-thing.output.exit_code }}). Approve to run the recovery path, or reject to leave the failure recorded and move on."
+      on_reject: skip
+    - id: recover
+      type: if
+      condition: "{{ steps.review.output.choice == 'approve' }}"
+      then:
+        - id: rerun
+          command: speckit.recovery
+  else:
+    - id: next-thing
+      command: speckit.next-thing
+```
+
+A few things worth knowing about that example:
+
+- Both gate options (`approve`, `reject`) return `StepStatus.COMPLETED`;
+  `on_reject: skip` controls only whether the engine aborts on reject
+  (it doesn't, with `skip`) — it does **not** auto-skip subsequent
+  sibling steps in the `then:` list. Downstream branching is the
+  workflow author's responsibility: read
+  `{{ steps.<gate-id>.output.choice }}` in a follow-up `if`, `switch`,
+  or expression, as the `recover` step above does.
+- `on_reject` has three values: `abort` (default — reject → `StepStatus.FAILED`
+  with `output.aborted = True`, halts the run), `skip` (reject →
+  `StepStatus.COMPLETED`, author handles branching as shown), and `retry`
+  (reject → `StepStatus.PAUSED` so the next `specify workflow resume` re-runs
+  the gate).
+- Gates do not automatically re-run the failed step. To express a
+  retry path, either define custom gate options and branch on the
+  choice downstream, or wrap the failing step in your own loop.
+
+**Notes:**
+
+- The field must be a literal boolean (`true` / `false`); coerced
+  strings like `"true"` are rejected at validation time.
+- **Scope: returned failures only.** The flag applies to step results
+  with `status=StepStatus.FAILED`. Unhandled exceptions raised out of a step's
+  `execute()` method are caught one level up by `WorkflowEngine.execute()`,
+  logged as `workflow_failed`, and abort the run regardless of
+  `continue_on_error`. If a step author wants the flag to cover an
+  exceptional path, the step must catch the exception internally and
+  return `StepResult(status=StepStatus.FAILED, ...)` with the failure encoded in
+  `output` (e.g. `exit_code`, `stderr`, or a custom field).
+- Gate aborts (`on_reject: abort` chosen by the operator) always halt
+  the run — `continue_on_error` does not override them. The flag is
+  for transient/expected step failures, not for overriding deliberate
+  operator decisions.
+- Structural validation runs up-front: `specify workflow run` rejects
+  invalid workflow definitions before the run is created, so
+  validation failures never reach this code path.
+- When the flag is omitted, behaviour is byte-equivalent to before
+  this feature.
+
 ## Expressions
 
 Workflow definitions use `{{ expression }}` syntax for dynamic values:
 
 ```yaml
 # Access inputs
-args: "{{ inputs.feature_name }}"
+args: "{{ inputs.spec }}"
 
 # Access previous step outputs
 args: "{{ steps.specify.output.file }}"
@@ -237,7 +332,34 @@ condition: "{{ steps.run-tests.output.exit_code != 0 }}"
 message: "{{ status | default('pending') }}"
 ```
 
-Supported filters: `default`, `join`, `contains`, `map`.
+Supported filters: `default`, `join`, `contains`, `map`, `from_json`.
+
+### Runtime Context
+
+`{{ context.* }}` exposes engine-managed runtime metadata for the
+current run:
+
+| Variable | Description |
+|----------|-------------|
+| `context.run_id` | The current workflow run id (the same value Spec Kit prints as `Run ID:` at the end of `workflow run`). Auto-generated runs are 8-character hex from `uuid4`; operator-supplied ids may be any alphanumeric string with hyphens or underscores. Empty string outside a run context. |
+
+```yaml
+# Stamp telemetry events with the run id for cross-system join.
+- id: emit-event
+  type: shell
+  run: 'echo "{\"run_id\":\"{{ context.run_id }}\",\"event\":\"started\"}" >> events.jsonl'
+
+# Per-run scratch directory.
+- id: prep-scratch
+  type: shell
+  run: 'mkdir -p /tmp/run-{{ context.run_id }}'
+
+# Pass run id into a command for artifact metadata.
+- id: tag-artifact
+  command: speckit.specify
+  input:
+    args: "{{ context.run_id }}"
+```
 
 ## Input Types
 
@@ -245,10 +367,10 @@ Workflow inputs are type-checked and coerced from CLI string values:
 
 ```yaml
 inputs:
-  feature_name:
+  spec:
     type: string
     required: true
-    prompt: "Feature name"
+    prompt: "Describe what you want to build"
   task_count:
     type: number
     default: 5

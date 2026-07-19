@@ -2,7 +2,7 @@
 Unit tests for extension skill auto-registration.
 
 Tests cover:
-- SKILL.md generation when --ai-skills was used during init
+- SKILL.md generation when skills mode was used during init
 - No skills created when ai_skills not active
 - SKILL.md content correctness
 - Existing user-modified skills not overwritten
@@ -11,23 +11,25 @@ Tests cover:
 """
 
 import json
+import os
 import pytest
 import tempfile
 import shutil
 import yaml
 from pathlib import Path
-from textwrap import dedent
+from typing import Any
 
 from specify_cli.extensions import (
     ExtensionManifest,
     ExtensionManager,
-    ExtensionError,
 )
 
 
 # ===== Helpers =====
 
-def _create_init_options(project_root: Path, ai: str = "claude", ai_skills: bool = True):
+def _create_init_options(
+    project_root: Path, ai: str = "claude", ai_skills: Any = True
+):
     """Write a .specify/init-options.json file."""
     opts_dir = project_root / ".specify"
     opts_dir.mkdir(parents=True, exist_ok=True)
@@ -36,7 +38,7 @@ def _create_init_options(project_root: Path, ai: str = "claude", ai_skills: bool
         "ai": ai,
         "ai_skills": ai_skills,
         "script": "sh",
-    }))
+    }), encoding="utf-8")
 
 
 def _create_skills_dir(project_root: Path, ai: str = "claude") -> Path:
@@ -88,7 +90,7 @@ def _create_extension_dir(temp_dir: Path, ext_id: str = "test-ext") -> Path:
     }
 
     with open(ext_dir / "extension.yml", "w") as f:
-        yaml.dump(manifest_data, f)
+        yaml.safe_dump(manifest_data, f)
 
     commands_dir = ext_dir / "commands"
     commands_dir.mkdir()
@@ -115,6 +117,62 @@ def _create_extension_dir(temp_dir: Path, ext_id: str = "test-ext") -> Path:
     )
 
     return ext_dir
+
+
+def _create_unicode_extension_dir(temp_dir: Path, ext_id: str = "uni-ext") -> Path:
+    """Create an extension whose command description contains non-ASCII characters."""
+    ext_dir = temp_dir / ext_id
+    ext_dir.mkdir()
+    description = "Prüfe Konformität der Implementierung"
+
+    manifest_data = {
+        "schema_version": "1.0",
+        "extension": {
+            "id": ext_id,
+            "name": "Unicode Extension",
+            "version": "1.0.0",
+            "description": description,
+        },
+        "requires": {"speckit_version": ">=0.1.0"},
+        "provides": {
+            "commands": [
+                {
+                    "name": f"speckit.{ext_id}.hello",
+                    "file": "commands/hello.md",
+                    "description": description,
+                },
+            ]
+        },
+    }
+
+    with open(ext_dir / "extension.yml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(manifest_data, f, allow_unicode=True)
+
+    commands_dir = ext_dir / "commands"
+    commands_dir.mkdir()
+    (commands_dir / "hello.md").write_text(
+        "---\n"
+        f'description: "{description}"\n'
+        "---\n"
+        "\n"
+        "# Hello\n"
+        "\n"
+        "Body.\n",
+        encoding="utf-8",
+    )
+    return ext_dir
+
+
+def _can_create_symlink(temp_dir: Path) -> bool:
+    """Return True when the current platform/user can create file symlinks."""
+    target = temp_dir / "symlink-target.txt"
+    link = temp_dir / "symlink-link.txt"
+    target.write_text("ok", encoding="utf-8")
+    try:
+        os.symlink(target, link)
+    except OSError:
+        return False
+    return link.is_symlink()
 
 
 # ===== Fixtures =====
@@ -148,7 +206,7 @@ def extension_dir(temp_dir):
 
 @pytest.fixture
 def skills_project(project_dir):
-    """Create a project with --ai-skills enabled and skills directory."""
+    """Create a project with skills mode enabled and skills directory."""
     _create_init_options(project_dir, ai="claude", ai_skills=True)
     skills_dir = _create_skills_dir(project_dir, ai="claude")
     return project_dir, skills_dir
@@ -156,7 +214,7 @@ def skills_project(project_dir):
 
 @pytest.fixture
 def no_skills_project(project_dir):
-    """Create a project without --ai-skills."""
+    """Create a project without skills mode."""
     _create_init_options(project_dir, ai="claude", ai_skills=False)
     return project_dir
 
@@ -174,24 +232,32 @@ class TestExtensionManagerGetSkillsDir:
         assert result == skills_dir
 
     def test_returns_none_when_no_ai_skills(self, no_skills_project):
-        """Should return None when ai_skills is false."""
+        """Should return None when ai_skills is false and not create the dir."""
         manager = ExtensionManager(no_skills_project)
         result = manager._get_skills_dir()
         assert result is None
+        # Ensure the directory was NOT created on disk
+        from specify_cli import _get_skills_dir as resolve_skills_dir
+        skills_path = resolve_skills_dir(no_skills_project, "claude")
+        assert not skills_path.exists()
 
     def test_returns_none_when_no_init_options(self, project_dir):
-        """Should return None when init-options.json is missing."""
+        """Should return None when init-options.json is missing and not create any dir."""
         manager = ExtensionManager(project_dir)
         result = manager._get_skills_dir()
         assert result is None
+        # No agent skills directory should have been created
+        assert not (project_dir / ".claude" / "skills").exists()
+        assert not (project_dir / ".agents" / "skills").exists()
 
-    def test_returns_none_when_skills_dir_missing(self, project_dir):
-        """Should return None when skills dir doesn't exist on disk."""
+    def test_creates_skills_dir_on_demand(self, project_dir):
+        """Should create skills dir when ai_skills is enabled but dir is missing."""
         _create_init_options(project_dir, ai="claude", ai_skills=True)
-        # Don't create the skills directory
+        # Don't create the skills directory — _get_skills_dir should do it
         manager = ExtensionManager(project_dir)
         result = manager._get_skills_dir()
-        assert result is None
+        assert result is not None
+        assert result.is_dir()
 
     def test_returns_kimi_skills_dir_when_ai_skills_disabled(self, project_dir):
         """Kimi should still use its native skills dir when ai_skills is false."""
@@ -201,11 +267,20 @@ class TestExtensionManagerGetSkillsDir:
         result = manager._get_skills_dir()
         assert result == skills_dir
 
+    def test_returns_none_when_ai_skills_is_non_boolean_truthy(self, project_dir):
+        """Corrupted truthy ai_skills values should not enable skills mode."""
+        _create_init_options(project_dir, ai="claude", ai_skills="false")
+
+        manager = ExtensionManager(project_dir)
+        result = manager._get_skills_dir()
+        assert result is None
+        assert not (project_dir / ".claude" / "skills").exists()
+
     def test_returns_none_for_non_dict_init_options(self, project_dir):
         """Corrupted-but-parseable init-options should not crash skill-dir lookup."""
         opts_file = project_dir / ".specify" / "init-options.json"
         opts_file.parent.mkdir(parents=True, exist_ok=True)
-        opts_file.write_text("[]")
+        opts_file.write_text("[]", encoding="utf-8")
         _create_skills_dir(project_dir, ai="claude")
         manager = ExtensionManager(project_dir)
         result = manager._get_skills_dir()
@@ -221,7 +296,7 @@ class TestExtensionSkillRegistration:
         """Skills should be created when ai_skills is enabled."""
         project_dir, skills_dir = skills_project
         manager = ExtensionManager(project_dir)
-        manifest = manager.install_from_directory(
+        manager.install_from_directory(
             extension_dir, "0.1.0", register_commands=False
         )
 
@@ -270,7 +345,313 @@ class TestExtensionSkillRegistration:
         assert isinstance(parsed, dict)
         assert parsed["name"] == "speckit-test-ext-hello"
         assert "description" in parsed
-        assert parsed["disable-model-invocation"] is True
+        assert parsed["disable-model-invocation"] is False
+
+    def test_register_extension_skills_rewrites_extension_relative_body_paths(
+        self, skills_project, temp_dir
+    ):
+        """Direct extension skill registration should rewrite extension-owned paths."""
+        project_dir, skills_dir = skills_project
+        ext_dir = temp_dir / "asset-skill-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "agents" / "control").mkdir(parents=True)
+        (ext_dir / "knowledge-base").mkdir()
+        (ext_dir / "agents" / "control" / "commander.md").write_text("agent", encoding="utf-8")
+        (ext_dir / "knowledge-base" / "scores.yaml").write_text("scores: []", encoding="utf-8")
+        (ext_dir / "commands" / "run.md").write_text(
+            "---\n"
+            "description: Run asset skill\n"
+            "---\n\n"
+            "Read agents/control/commander.md.\n"
+            "Load knowledge-base/scores.yaml.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "asset-skill-ext",
+                        "name": "Asset Skill Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.asset-skill-ext.run",
+                                "file": "commands/run.md",
+                                "description": "Run asset skill",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        content = (skills_dir / "speckit-asset-skill-ext-run" / "SKILL.md").read_text(encoding="utf-8")
+        assert ".specify/extensions/asset-skill-ext/agents/control/commander.md" in content
+        assert ".specify/extensions/asset-skill-ext/knowledge-base/scores.yaml" in content
+        assert "Read agents/control/commander.md" not in content
+        assert "Load knowledge-base/scores.yaml" not in content
+
+    def test_register_extension_skills_translates_claude_behavior_frontmatter(
+        self, skills_project, temp_dir
+    ):
+        """Neutral behavior frontmatter should control generated Claude skill metadata."""
+        project_dir, skills_dir = skills_project
+        ext_dir = temp_dir / "behavior-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "commands" / "review.md").write_text(
+            "---\n"
+            "description: Review with constrained tools\n"
+            "behavior:\n"
+            "  tools: read-only\n"
+            "  invocation: explicit\n"
+            "  visibility: model\n"
+            "agents:\n"
+            "  claude:\n"
+            "    model: claude-opus-test\n"
+            "---\n\n"
+            "Review the implementation.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "behavior-ext",
+                        "name": "Behavior Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.behavior-ext.review",
+                                "file": "commands/review.md",
+                                "description": "Review with constrained tools",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        content = (skills_dir / "speckit-behavior-ext-review" / "SKILL.md").read_text(encoding="utf-8")
+        frontmatter = yaml.safe_load(content.split("---", 2)[1])
+        assert frontmatter["allowed-tools"] == "Read Grep Glob"
+        assert frontmatter["disable-model-invocation"] is True
+        assert frontmatter["user-invocable"] is False
+        assert frontmatter["model"] == "claude-opus-test"
+        assert "behavior" not in frontmatter
+        assert "agents" not in frontmatter
+
+    def test_install_skips_direct_skill_for_claude_agent_deployment(
+        self, skills_project, temp_dir
+    ):
+        """Agent-deployed extension commands should not also create SKILL.md files."""
+        project_dir, skills_dir = skills_project
+        ext_dir = temp_dir / "agent-deploy-ext"
+        ext_dir.mkdir()
+        (ext_dir / "commands").mkdir()
+        (ext_dir / "commands" / "review.md").write_text(
+            "---\n"
+            "description: Review as an agent\n"
+            "behavior:\n"
+            "  execution: agent\n"
+            "  tools: read-only\n"
+            "---\n\n"
+            "Review from an agent definition.\n",
+            encoding="utf-8",
+        )
+        (ext_dir / "extension.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "1.0",
+                    "extension": {
+                        "id": "agent-deploy-ext",
+                        "name": "Agent Deploy Extension",
+                        "version": "1.0.0",
+                        "description": "Test",
+                    },
+                    "requires": {"speckit_version": ">=0.1.0"},
+                    "provides": {
+                        "commands": [
+                            {
+                                "name": "speckit.agent-deploy-ext.review",
+                                "file": "commands/review.md",
+                                "description": "Review as an agent",
+                            }
+                        ]
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=True)
+
+        assert (project_dir / ".claude" / "agents" / "speckit-agent-deploy-ext-review.md").exists()
+        assert not (skills_dir / "speckit-agent-deploy-ext-review" / "SKILL.md").exists()
+
+    def test_argument_hint_preserved_for_extension_command(
+        self, skills_project, temp_dir
+    ):
+        """argument-hint from an extension command must survive into SKILL.md.
+
+        Regression for #2903: the field was dropped for extension-provided
+        commands while being kept for core template commands. The source
+        description is intentionally long so it folds across multiple lines
+        when serialized, guarding against an in-place string injection that
+        would split the folded scalar and produce invalid YAML.
+        """
+        project_dir, skills_dir = skills_project
+
+        long_description = (
+            "Build and maintain a lean, static context/ knowledge folder so "
+            "coding agents load only what is relevant and save tokens"
+        )
+        arg_hint = "<init | update | list | check> [area] [slug] [-- notes]"
+
+        ext_dir = temp_dir / "hint-ext"
+        ext_dir.mkdir()
+        manifest_data = {
+            "schema_version": "1.0",
+            "extension": {
+                "id": "hint-ext",
+                "name": "Hint Extension",
+                "version": "1.0.0",
+                "description": "Extension exercising argument-hint preservation",
+            },
+            "requires": {"speckit_version": ">=0.1.0"},
+            "provides": {
+                "commands": [
+                    {
+                        "name": "speckit.hint-ext.build-context",
+                        "file": "commands/build-context.md",
+                        "description": long_description,
+                    }
+                ]
+            },
+        }
+        with open(ext_dir / "extension.yml", "w") as f:
+            yaml.dump(manifest_data, f)
+        commands_dir = ext_dir / "commands"
+        commands_dir.mkdir()
+        (commands_dir / "build-context.md").write_text(
+            "---\n"
+            f'description: "{long_description}"\n'
+            f'argument-hint: "{arg_hint}"\n'
+            "---\n"
+            "\n"
+            "# Build Context\n"
+            "\n"
+            "Do the thing.\n"
+            "$ARGUMENTS\n",
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        skill_file = skills_dir / "speckit-hint-ext-build-context" / "SKILL.md"
+        assert skill_file.exists()
+        content = skill_file.read_text(encoding="utf-8")
+
+        # Frontmatter must parse cleanly even though the description folds.
+        parts = content.split("---", 2)
+        assert len(parts) >= 3
+        parsed = yaml.safe_load(parts[1])
+        assert parsed["argument-hint"] == arg_hint
+        assert parsed["description"] == long_description
+
+    def test_argument_hint_not_added_for_non_claude_agent(self, project_dir, temp_dir):
+        """argument-hint must stay Claude-only — other skills agents are untouched.
+
+        The hint is carried only for integrations that support it (currently
+        Claude, the sole integration defining inject_argument_hint). A non-Claude
+        skills agent such as kimi must keep the shared build_skill_frontmatter
+        shape (name/description/compatibility/metadata) with no argument-hint.
+        """
+        _create_init_options(project_dir, ai="kimi", ai_skills=True)
+        skills_dir = _create_skills_dir(project_dir, ai="kimi")
+
+        arg_hint = "<init | update | list | check> [area]"
+        ext_dir = temp_dir / "hint-ext-kimi"
+        ext_dir.mkdir()
+        manifest_data = {
+            "schema_version": "1.0",
+            "extension": {
+                "id": "hint-ext-kimi",
+                "name": "Hint Extension Kimi",
+                "version": "1.0.0",
+                "description": "Extension exercising argument-hint gating",
+            },
+            "requires": {"speckit_version": ">=0.1.0"},
+            "provides": {
+                "commands": [
+                    {
+                        "name": "speckit.hint-ext-kimi.build-context",
+                        "file": "commands/build-context.md",
+                        "description": "Build context",
+                    }
+                ]
+            },
+        }
+        with open(ext_dir / "extension.yml", "w") as f:
+            yaml.dump(manifest_data, f)
+        commands_dir = ext_dir / "commands"
+        commands_dir.mkdir()
+        (commands_dir / "build-context.md").write_text(
+            "---\n"
+            'description: "Build context"\n'
+            f'argument-hint: "{arg_hint}"\n'
+            "---\n"
+            "\n"
+            "# Build Context\n"
+            "\n"
+            "Do the thing.\n"
+            "$ARGUMENTS\n",
+            encoding="utf-8",
+        )
+
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        skill_file = skills_dir / "speckit-hint-ext-kimi-build-context" / "SKILL.md"
+        assert skill_file.exists()
+        parsed = yaml.safe_load(skill_file.read_text(encoding="utf-8").split("---", 2)[1])
+        assert "argument-hint" not in parsed
+
+    def test_skill_md_unicode(self, skills_project, temp_dir):
+        """SKILL.md generation should preserve non-ASCII characters."""
+        project_dir, skills_dir = skills_project
+        ext_dir = _create_unicode_extension_dir(temp_dir)
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
+
+        skill_file = skills_dir / "speckit-uni-ext-hello" / "SKILL.md"
+        content = skill_file.read_text(encoding="utf-8")
+
+        assert "Prüfe Konformität" in content
 
     def test_no_skills_when_ai_skills_disabled(self, no_skills_project, extension_dir):
         """No skills should be created when ai_skills is false."""
@@ -316,6 +697,227 @@ class TestExtensionSkillRegistration:
         assert "speckit-test-ext-world" in metadata["registered_skills"]
         # The pre-existing one should NOT be in registered_skills (it was skipped)
         assert "speckit-test-ext-hello" not in metadata["registered_skills"]
+
+    def test_dev_skill_symlink_refreshes_existing_cache(
+        self, skills_project, extension_dir, temp_dir
+    ):
+        """Dev-mode skill symlinks should refresh rendered cache content."""
+        if not _can_create_symlink(temp_dir):
+            pytest.skip("Current platform/user cannot create symlinks")
+
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+
+        manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        assert skill_file.is_symlink()
+        assert "Run this to say hello." in skill_file.read_text(encoding="utf-8")
+
+        (extension_dir / "commands" / "hello.md").write_text(
+            "---\n"
+            "description: \"Updated test hello command\"\n"
+            "---\n"
+            "\n"
+            "# Hello Command\n"
+            "\n"
+            "Run this updated hello.\n"
+        )
+
+        written = manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        assert "speckit-test-ext-hello" in written
+        assert "Run this updated hello." in skill_file.read_text(encoding="utf-8")
+
+    def test_codex_dev_skill_registration_replaces_existing_dev_symlink(
+        self, project_dir, extension_dir, temp_dir
+    ):
+        """Codex dev skill registration should migrate prior dev symlinks to files."""
+        if not _can_create_symlink(temp_dir):
+            pytest.skip("Current platform/user cannot create symlinks")
+
+        _create_init_options(project_dir, ai="codex", ai_skills=True)
+        skills_dir = _create_skills_dir(project_dir, ai="codex")
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file = (
+            extension_dir
+            / ".specify-dev"
+            / "extension-skills"
+            / "speckit-test-ext-hello"
+            / "SKILL.md"
+        )
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("old linked content", encoding="utf-8")
+        os.symlink(os.path.relpath(cache_file, skill_file.parent), skill_file)
+
+        written = manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        assert "speckit-test-ext-hello" in written
+        assert skill_file.exists()
+        assert not skill_file.is_symlink()
+        assert "Run this to say hello." in skill_file.read_text(encoding="utf-8")
+        assert cache_file.read_text(encoding="utf-8") == "old linked content"
+
+    def test_codex_dev_skill_registration_preserves_unrelated_symlink(
+        self, project_dir, extension_dir, temp_dir
+    ):
+        """Codex dev registration should not overwrite user-owned symlinks."""
+        if not _can_create_symlink(temp_dir):
+            pytest.skip("Current platform/user cannot create symlinks")
+
+        _create_init_options(project_dir, ai="codex", ai_skills=True)
+        skills_dir = _create_skills_dir(project_dir, ai="codex")
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True, exist_ok=True)
+        unrelated_cache_file = (
+            temp_dir
+            / "other-extension"
+            / ".specify-dev"
+            / "extension-skills"
+            / "speckit-test-ext-hello"
+            / "SKILL.md"
+        )
+        unrelated_cache_file.parent.mkdir(parents=True)
+        unrelated_cache_file.write_text("user-owned linked content", encoding="utf-8")
+        os.symlink(
+            os.path.relpath(unrelated_cache_file, skill_file.parent), skill_file
+        )
+
+        written = manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        assert "speckit-test-ext-hello" not in written
+        assert skill_file.is_symlink()
+        assert skill_file.resolve(strict=True) == unrelated_cache_file.resolve()
+        assert unrelated_cache_file.read_text(encoding="utf-8") == (
+            "user-owned linked content"
+        )
+
+    def test_dev_skill_registration_falls_back_to_copy_when_symlink_fails(
+        self, skills_project, extension_dir, monkeypatch
+    ):
+        """Dev-mode skill registration works when Windows cannot create symlinks."""
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+
+        def raise_windows_symlink_error(target, link):
+            raise OSError("A required privilege is not held by the client")
+
+        monkeypatch.setattr(
+            "specify_cli.extensions.os.symlink", raise_windows_symlink_error
+        )
+
+        written = manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        assert "speckit-test-ext-hello" in written
+        assert skill_file.exists()
+        assert not skill_file.is_symlink()
+        assert "Run this to say hello." in skill_file.read_text(encoding="utf-8")
+        assert (
+            extension_dir
+            / ".specify-dev"
+            / "extension-skills"
+            / "speckit-test-ext-hello"
+            / "SKILL.md"
+        ).exists()
+
+    def test_dev_skill_registration_falls_back_to_copy_when_relpath_fails(
+        self, skills_project, extension_dir, monkeypatch
+    ):
+        """Dev-mode skill registration stays functional across Windows drive roots."""
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+
+        def raise_relpath_error(path, start=None):
+            raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+        monkeypatch.setattr(
+            "specify_cli.extensions.os.path.relpath", raise_relpath_error
+        )
+
+        written = manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        assert "speckit-test-ext-hello" in written
+        assert skill_file.exists()
+        assert not skill_file.is_symlink()
+        assert "Run this to say hello." in skill_file.read_text(encoding="utf-8")
+        assert (
+            extension_dir
+            / ".specify-dev"
+            / "extension-skills"
+            / "speckit-test-ext-hello"
+            / "SKILL.md"
+        ).exists()
+
+    def test_dev_skill_registration_falls_back_to_copy_when_cache_write_fails(
+        self, skills_project, extension_dir, monkeypatch
+    ):
+        """Dev-mode skill registration stays functional when the dev cache is unwritable."""
+        project_dir, skills_dir = skills_project
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+        original_write_text = Path.write_text
+
+        def raise_cache_write_error(path, *args, **kwargs):
+            if ".specify-dev" in path.parts:
+                raise OSError("cache is not writable")
+            return original_write_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", raise_cache_write_error)
+
+        written = manager._register_extension_skills(
+            manifest,
+            extension_dir,
+            link_outputs=True,
+        )
+
+        skill_file = skills_dir / "speckit-test-ext-hello" / "SKILL.md"
+        assert "speckit-test-ext-hello" in written
+        assert skill_file.exists()
+        assert not skill_file.is_symlink()
+        assert "Run this to say hello." in skill_file.read_text(encoding="utf-8")
+        assert not (
+            extension_dir
+            / ".specify-dev"
+            / "extension-skills"
+            / "speckit-test-ext-hello"
+            / "SKILL.md"
+        ).exists()
 
     def test_registered_skills_in_registry(self, skills_project, extension_dir):
         """Registry should contain registered_skills list."""
@@ -389,7 +991,7 @@ class TestExtensionSkillRegistration:
             },
         }
         with open(ext_dir / "extension.yml", "w") as f:
-            yaml.dump(manifest_data, f)
+            yaml.safe_dump(manifest_data, f)
 
         (ext_dir / "commands").mkdir()
         (ext_dir / "commands" / "plan.md").write_text(
@@ -397,11 +999,8 @@ class TestExtensionSkillRegistration:
             "description: Scripted plan command\n"
             "scripts:\n"
             "  sh: ../../scripts/bash/setup-plan.sh --json \"{ARGS}\"\n"
-            "agent_scripts:\n"
-            "  sh: ../../scripts/bash/update-agent-context.sh __AGENT__\n"
             "---\n\n"
             "Run {SCRIPT}\n"
-            "Then {AGENT_SCRIPT}\n"
             "Review templates/checklist.md and memory/constitution.md for __AGENT__.\n"
         )
 
@@ -410,11 +1009,9 @@ class TestExtensionSkillRegistration:
 
         content = (skills_dir / "speckit-scripted-ext-plan" / "SKILL.md").read_text()
         assert "{SCRIPT}" not in content
-        assert "{AGENT_SCRIPT}" not in content
         assert "{ARGS}" not in content
         assert "__AGENT__" not in content
         assert '.specify/scripts/bash/setup-plan.sh --json "$ARGUMENTS"' in content
-        assert ".specify/scripts/bash/update-agent-context.sh claude" in content
         assert ".specify/templates/checklist.md" in content
         assert ".specify/memory/constitution.md" in content
 
@@ -449,7 +1046,7 @@ class TestExtensionSkillRegistration:
             },
         }
         with open(ext_dir / "extension.yml", "w") as f:
-            yaml.dump(manifest_data, f)
+            yaml.safe_dump(manifest_data, f)
 
         (ext_dir / "commands").mkdir()
         (ext_dir / "commands" / "exists.md").write_text(
@@ -465,6 +1062,512 @@ class TestExtensionSkillRegistration:
         metadata = manager.registry.get(manifest.id)
         assert "speckit-missing-cmd-ext-exists" in metadata["registered_skills"]
         assert "speckit-missing-cmd-ext-ghost" not in metadata["registered_skills"]
+
+    @pytest.mark.parametrize("ai", ["claude", "codex"])
+    def test_skills_registered_when_dir_missing(self, project_dir, temp_dir, ai):
+        """Extension add should create skills dir on demand and register skills.
+
+        Regression test for https://github.com/github/spec-kit/issues/2682:
+        when an extension is installed before the agent skills directory exists,
+        skills must still be materialized (the directory is created on demand).
+        """
+        _create_init_options(project_dir, ai=ai, ai_skills=True)
+        # Deliberately do NOT create the skills directory
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=False
+        )
+
+        # Skills dir should have been created automatically
+        from specify_cli import _get_skills_dir as resolve_skills_dir
+        skills_dir = resolve_skills_dir(project_dir, ai)
+        assert skills_dir.is_dir()
+
+        # SKILL.md files should exist
+        assert (skills_dir / "speckit-early-ext-hello" / "SKILL.md").exists()
+        assert (skills_dir / "speckit-early-ext-world" / "SKILL.md").exists()
+
+        # Registry should record them
+        metadata = manager.registry.get(manifest.id)
+        assert len(metadata["registered_skills"]) == 2
+        assert "speckit-early-ext-hello" in metadata["registered_skills"]
+        assert "speckit-early-ext-world" in metadata["registered_skills"]
+
+    def test_commands_registered_when_claude_skills_dir_missing(self, project_dir, temp_dir):
+        """Extension install should not silently skip Claude when skills dir is missing."""
+        _create_init_options(project_dir, ai="claude", ai_skills=True)
+        (project_dir / ".claude").mkdir()
+        # Deliberately do NOT create .claude/skills
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        skills_dir = project_dir / ".claude" / "skills"
+        assert skills_dir.is_dir()
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata["registered_commands"] == {
+            "claude": [
+                "speckit.early-ext.hello",
+                "speckit.early-ext.world",
+            ]
+        }
+        assert metadata["registered_skills"] == []
+
+        skill_file = skills_dir / "speckit-early-ext-hello" / "SKILL.md"
+        assert skill_file.exists()
+        content = skill_file.read_text(encoding="utf-8")
+        assert "source: early-ext:commands/hello.md" in content
+
+    def test_hermes_global_skills_dir_used_when_marker_is_recovered(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """Hermes recovery must not use the project marker as the output dir."""
+        home = temp_dir / "home"
+        home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: home)
+        _create_init_options(project_dir, ai="hermes", ai_skills=True)
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {
+            "hermes": [
+                "speckit.early-ext.hello",
+                "speckit.early-ext.world",
+            ]
+        }
+        assert metadata["registered_skills"] == []
+
+        global_skills_dir = home / ".hermes" / "skills"
+        assert (
+            global_skills_dir / "speckit-early-ext-hello" / "SKILL.md"
+        ).exists()
+        assert (
+            global_skills_dir / "speckit-early-ext-world" / "SKILL.md"
+        ).exists()
+
+        marker = project_dir / ".hermes" / "skills"
+        assert marker.is_dir()
+        assert list(marker.glob("speckit-*/SKILL.md")) == []
+
+    def test_hermes_get_skills_dir_creates_global_output_dir(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """ExtensionManager should create the agent-specific output dir it returns."""
+        home = temp_dir / "home"
+        home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: home)
+        _create_init_options(project_dir, ai="hermes", ai_skills=True)
+
+        manager = ExtensionManager(project_dir)
+        skills_dir = manager._get_skills_dir()
+
+        assert skills_dir == home / ".hermes" / "skills"
+        assert skills_dir.is_dir()
+        assert (project_dir / ".hermes" / "skills").is_dir()
+
+    def test_unusable_hermes_global_skills_dir_skips_skill_registration(
+        self, project_dir, temp_dir, monkeypatch, capsys
+    ):
+        """An unusable agent-specific output dir should warn and skip skills."""
+        home = temp_dir / "home"
+        hermes_dir = home / ".hermes"
+        hermes_dir.mkdir(parents=True)
+        (hermes_dir / "skills").write_text("not a directory", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", lambda: home)
+        _create_init_options(project_dir, ai="hermes", ai_skills=True)
+        ext_dir = _create_extension_dir(temp_dir, ext_id="blocked-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=False
+        )
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_skills"] == []
+        captured = capsys.readouterr()
+        assert "Warning:" in captured.out
+        assert "Continuing without skill registration." in captured.out
+
+    def test_detect_dir_marker_file_does_not_register_hermes_commands(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """Regular files at detect_dir marker paths should not detect agents."""
+        home = temp_dir / "home"
+        global_skills_dir = home / ".hermes" / "skills"
+        global_skills_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        _create_init_options(project_dir, ai="hermes", ai_skills=True)
+        marker_parent = project_dir / ".hermes"
+        marker_parent.mkdir()
+        marker_file = marker_parent / "skills"
+        marker_file.write_text("not a directory", encoding="utf-8")
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        assert marker_file.is_file()
+        assert marker_file.read_text(encoding="utf-8") == "not a directory"
+        assert not (
+            global_skills_dir / "speckit-early-ext-hello" / "SKILL.md"
+        ).exists()
+        assert not (
+            global_skills_dir / "speckit-early-ext-world" / "SKILL.md"
+        ).exists()
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {}
+        assert metadata["registered_skills"] == []
+
+    def test_non_boolean_ai_skills_does_not_recover_missing_skills_dir(
+        self, project_dir, temp_dir
+    ):
+        """Corrupted truthy ai_skills values should not recover skills dirs."""
+        _create_init_options(project_dir, ai="claude", ai_skills="false")
+        (project_dir / ".claude").mkdir()
+        # Deliberately do NOT create .claude/skills.
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {}
+        assert metadata["registered_skills"] == []
+        assert not (project_dir / ".claude" / "skills").exists()
+
+    def test_non_boolean_ai_skills_does_not_skip_default_agent_reregistration(
+        self, project_dir, temp_dir
+    ):
+        """Corrupted ai_skills values should not trigger skills-mode skips."""
+        _create_init_options(project_dir, ai="copilot", ai_skills="false")
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=False
+        )
+        manager.register_enabled_extensions_for_agent("copilot")
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {
+            "copilot": [
+                "speckit.early-ext.hello",
+                "speckit.early-ext.world",
+            ]
+        }
+        assert metadata["registered_skills"] == []
+        assert (project_dir / ".github" / "agents").is_dir()
+
+    def test_one_failing_extension_does_not_abort_the_rest(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """A single failing extension must not block registration of the others.
+
+        Regression for #2950: ``register_enabled_extensions_for_agent`` iterates
+        enabled extensions; before the per-extension isolation, the first one
+        that raised (e.g. an OSError writing a command file) aborted the loop and
+        the exception propagated, so every later extension was silently skipped.
+        """
+        from specify_cli.extensions import CommandRegistrar
+
+        _create_init_options(project_dir, ai="claude", ai_skills=False)
+        manager = ExtensionManager(project_dir)
+        # Two enabled extensions; the first one iterated ("aaa-fail") will raise.
+        manager.install_from_directory(
+            _create_extension_dir(temp_dir, ext_id="aaa-fail"), "0.1.0",
+            register_commands=False,
+        )
+        manager.install_from_directory(
+            _create_extension_dir(temp_dir, ext_id="bbb-ok"), "0.1.0",
+            register_commands=False,
+        )
+
+        original = CommandRegistrar.register_commands_for_agent
+
+        def flaky(self, agent_name, manifest, ext_dir, project_root, link_outputs=False):
+            if manifest.id == "aaa-fail":
+                raise OSError("simulated command-file write failure")
+            return original(
+                self, agent_name, manifest, ext_dir, project_root,
+                link_outputs=link_outputs,
+            )
+
+        monkeypatch.setattr(CommandRegistrar, "register_commands_for_agent", flaky)
+
+        # Must not propagate, despite the first extension failing.
+        manager.register_enabled_extensions_for_agent("claude")
+
+        # The healthy extension was still registered for the agent...
+        ok_meta = manager.registry.get("bbb-ok")
+        assert "claude" in ok_meta["registered_commands"], (
+            "a later extension must still register after an earlier one fails (#2950)"
+        )
+        # ...and the failing one was not.
+        fail_meta = manager.registry.get("aaa-fail")
+        assert "claude" not in fail_meta.get("registered_commands", {})
+
+    def test_skill_registration_failure_preserves_registered_commands(
+        self, project_dir, temp_dir, monkeypatch, capsys
+    ):
+        """Persist successful command registration even if skills fail.
+
+        If command files are written but skill generation raises, the command
+        registry must still be updated so later unregister/cleanup can find the
+        command files.
+        """
+        _create_init_options(project_dir, ai="claude", ai_skills=False)
+        manager = ExtensionManager(project_dir)
+        manager.install_from_directory(
+            _create_extension_dir(temp_dir, ext_id="skill-fail"), "0.1.0",
+            register_commands=False,
+        )
+
+        def fail_skills(self, manifest, ext_dir, link_outputs=False):
+            raise OSError("simulated skill directory failure")
+
+        monkeypatch.setattr(
+            ExtensionManager, "_register_extension_skills", fail_skills
+        )
+
+        manager.register_enabled_extensions_for_agent("claude")
+
+        metadata = manager.registry.get("skill-fail")
+        assert metadata is not None
+        assert metadata["registered_commands"] == {
+            "claude": [
+                "speckit.skill-fail.hello",
+                "speckit.skill-fail.world",
+            ]
+        }
+        assert metadata["registered_skills"] == []
+
+        captured = capsys.readouterr()
+        assert "register extension skills for extension 'skill-fail'" in captured.out
+        assert "Continuing with available registration results" in captured.out
+
+    def test_existing_agent_command_path_file_is_not_detected(
+        self, project_dir, temp_dir
+    ):
+        """Existing files at command-dir paths should not count as detected agents."""
+        _create_init_options(project_dir, ai="claude", ai_skills=False)
+        claude_dir = project_dir / ".claude"
+        claude_dir.mkdir()
+        skills_file = claude_dir / "skills"
+        skills_file.write_text("not a directory", encoding="utf-8")
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        assert skills_file.read_text(encoding="utf-8") == "not a directory"
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {}
+        assert metadata["registered_skills"] == []
+
+    def test_missing_shared_skills_dir_registers_only_active_agent(self, project_dir, temp_dir):
+        """Recreating shared skills dirs should not activate unrelated agents."""
+        _create_init_options(project_dir, ai="agy", ai_skills=True)
+        (project_dir / ".agents").mkdir()
+        # Deliberately do NOT create .agents/skills, shared by agy and codex.
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        skills_dir = project_dir / ".agents" / "skills"
+        assert skills_dir.is_dir()
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata["registered_commands"] == {
+            "agy": [
+                "speckit.early-ext.hello",
+                "speckit.early-ext.world",
+            ]
+        }
+        assert metadata["registered_skills"] == []
+
+    def test_missing_shared_skills_dir_uses_normalized_guard_for_later_agents(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """Shared-dir suppression should tolerate lexical path differences."""
+        _create_init_options(project_dir, ai="agy", ai_skills=True)
+        (project_dir / ".agents").mkdir()
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        from specify_cli.agents import CommandRegistrar as AgentRegistrar
+
+        original_resolve_agent_dir = AgentRegistrar._resolve_agent_dir
+        original_register_commands = AgentRegistrar.register_commands
+        attempted_agents = []
+
+        def resolve_codex_with_parent_segment(self, agent_name, agent_config, root):
+            if agent_name == "codex":
+                return root / ".agents" / ".." / ".agents" / "skills"
+            return original_resolve_agent_dir(agent_name, agent_config, root)
+
+        def record_registration(self, agent_name, *args, **kwargs):
+            attempted_agents.append(agent_name)
+            return original_register_commands(self, agent_name, *args, **kwargs)
+
+        monkeypatch.setattr(
+            AgentRegistrar, "_resolve_agent_dir", resolve_codex_with_parent_segment
+        )
+        monkeypatch.setattr(AgentRegistrar, "register_commands", record_registration)
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        assert attempted_agents == ["agy"]
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {
+            "agy": [
+                "speckit.early-ext.hello",
+                "speckit.early-ext.world",
+            ]
+        }
+        assert metadata["registered_skills"] == []
+
+    def test_missing_shared_skills_dir_write_oserror_does_not_register_other_agents(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """Failed active registration must not make shared skills dirs detected."""
+        _create_init_options(project_dir, ai="agy", ai_skills=True)
+        (project_dir / ".agents").mkdir()
+        # Deliberately do NOT create .agents/skills, shared by agy and codex.
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        from specify_cli.agents import CommandRegistrar as AgentRegistrar
+
+        original_register_commands = AgentRegistrar.register_commands
+        attempted_agents = []
+
+        def fail_recovered_agy_registration(self, agent_name, *args, **kwargs):
+            attempted_agents.append(agent_name)
+            if agent_name == "agy":
+                raise PermissionError("denied")
+            return original_register_commands(self, agent_name, *args, **kwargs)
+
+        monkeypatch.setattr(
+            AgentRegistrar, "register_commands", fail_recovered_agy_registration
+        )
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        skills_dir = project_dir / ".agents" / "skills"
+        assert skills_dir.is_dir()
+        assert attempted_agents == ["agy"]
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata is not None
+        assert metadata["registered_commands"] == {}
+        assert "speckit-early-ext-hello" in metadata["registered_skills"]
+        assert "speckit-early-ext-world" in metadata["registered_skills"]
+
+    def test_missing_active_skills_dir_does_not_follow_symlinked_parent(
+        self, project_dir, temp_dir
+    ):
+        """Recovered command registration must reuse active skills-dir safety checks."""
+        if not hasattr(os, "symlink"):
+            pytest.skip("symlinks are unavailable")
+
+        _create_init_options(project_dir, ai="claude", ai_skills=True)
+        outside = temp_dir / "outside-claude"
+        outside.mkdir()
+        try:
+            os.symlink(outside, project_dir / ".claude", target_is_directory=True)
+        except OSError:
+            pytest.skip("Current platform/user cannot create directory symlinks")
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata["registered_commands"] == {}
+        assert metadata["registered_skills"] == []
+        assert not (outside / "skills").exists()
+
+    def test_missing_active_skills_dir_invalid_parent_skips_without_aborting(
+        self, project_dir, temp_dir
+    ):
+        """Invalid active skill parents should not abort extension installation."""
+        _create_init_options(project_dir, ai="claude", ai_skills=True)
+        (project_dir / ".claude").write_text("not a directory", encoding="utf-8")
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata["registered_commands"] == {}
+        assert metadata["registered_skills"] == []
+
+    def test_missing_active_skills_dir_write_oserror_skips_without_aborting(
+        self, project_dir, temp_dir, monkeypatch
+    ):
+        """Filesystem failures in recovered command registration should skip safely."""
+        _create_init_options(project_dir, ai="claude", ai_skills=True)
+        (project_dir / ".claude").mkdir()
+        ext_dir = _create_extension_dir(temp_dir, ext_id="early-ext")
+
+        from specify_cli.agents import CommandRegistrar as AgentRegistrar
+
+        original_register_commands = AgentRegistrar.register_commands
+
+        def fail_recovered_claude_registration(self, agent_name, *args, **kwargs):
+            if agent_name == "claude":
+                raise PermissionError("denied")
+            return original_register_commands(self, agent_name, *args, **kwargs)
+
+        monkeypatch.setattr(
+            AgentRegistrar, "register_commands", fail_recovered_claude_registration
+        )
+
+        manager = ExtensionManager(project_dir)
+        manifest = manager.install_from_directory(
+            ext_dir, "0.1.0", register_commands=True
+        )
+
+        metadata = manager.registry.get(manifest.id)
+        assert metadata["registered_commands"] == {}
+        assert "speckit-early-ext-hello" in metadata["registered_skills"]
+        assert "speckit-early-ext-world" in metadata["registered_skills"]
 
 
 # ===== Extension Skill Unregistration Tests =====
@@ -549,7 +1652,7 @@ class TestExtensionSkillEdgeCases:
         """Corrupted init-options payloads should disable skill registration, not crash install."""
         opts_file = project_dir / ".specify" / "init-options.json"
         opts_file.parent.mkdir(parents=True, exist_ok=True)
-        opts_file.write_text("[]")
+        opts_file.write_text("[]", encoding="utf-8")
         _create_skills_dir(project_dir, ai="claude")
 
         manager = ExtensionManager(project_dir)
@@ -586,7 +1689,7 @@ class TestExtensionSkillEdgeCases:
             },
         }
         with open(ext_dir / "extension.yml", "w") as f:
-            yaml.dump(manifest_data, f)
+            yaml.safe_dump(manifest_data, f)
 
         (ext_dir / "commands").mkdir()
         (ext_dir / "commands" / "plain.md").write_text(
@@ -594,7 +1697,7 @@ class TestExtensionSkillEdgeCases:
         )
 
         manager = ExtensionManager(project_dir)
-        manifest = manager.install_from_directory(
+        manager.install_from_directory(
             ext_dir, "0.1.0", register_commands=False
         )
 
@@ -613,7 +1716,7 @@ class TestExtensionSkillEdgeCases:
         ext_dir = _create_extension_dir(temp_dir, ext_id="test-ext")
 
         manager = ExtensionManager(project_dir)
-        manifest = manager.install_from_directory(
+        manager.install_from_directory(
             ext_dir, "0.1.0", register_commands=False
         )
 
@@ -629,10 +1732,10 @@ class TestExtensionSkillEdgeCases:
         ext_dir_b = _create_extension_dir(temp_dir, ext_id="ext-b")
 
         manager = ExtensionManager(project_dir)
-        manifest_a = manager.install_from_directory(
+        manager.install_from_directory(
             ext_dir_a, "0.1.0", register_commands=False
         )
-        manifest_b = manager.install_from_directory(
+        manager.install_from_directory(
             ext_dir_b, "0.1.0", register_commands=False
         )
 
@@ -673,7 +1776,7 @@ class TestExtensionSkillEdgeCases:
             },
         }
         with open(ext_dir / "extension.yml", "w") as f:
-            yaml.dump(manifest_data, f)
+            yaml.safe_dump(manifest_data, f)
 
         (ext_dir / "commands").mkdir()
         # Malformed YAML: invalid key-value syntax
@@ -690,7 +1793,7 @@ class TestExtensionSkillEdgeCases:
 
         manager = ExtensionManager(project_dir)
         # Should not raise
-        manifest = manager.install_from_directory(
+        manager.install_from_directory(
             ext_dir, "0.1.0", register_commands=False
         )
 
@@ -741,238 +1844,3 @@ class TestExtensionSkillEdgeCases:
         assert result is True
         assert not (skills_dir / "speckit-test-ext-hello").exists()
         assert not (skills_dir / "speckit-test-ext-world").exists()
-
-
-class TestPassthroughFrontmatter:
-    """Source frontmatter keys in _SKILL_PASSTHROUGH_KEYS survive into generated SKILL.md."""
-
-    def _make_project(self, tmp_path):
-        """Create project root with claude skills dir."""
-        project_root = tmp_path / "proj"
-        (project_root / ".claude" / "skills").mkdir(parents=True)
-        (project_root / ".specify").mkdir()
-        (project_root / ".specify" / "init-options.json").write_text(
-            '{"ai": "claude", "ai_skills": true, "script": "sh"}'
-        )
-        return project_root
-
-    def test_context_fork_passed_through(self, tmp_path):
-        import yaml
-        from specify_cli.agents import CommandRegistrar
-        project_root = self._make_project(tmp_path)
-        registrar = CommandRegistrar()
-        result = registrar.render_skill_command(
-            "claude", "speckit-test-ext-hello",
-            {"name": "speckit.test-ext.hello", "description": "Test", "context": "fork", "agent": "general-purpose"},
-            "Hello world", "test-ext", "commands/hello.md", project_root,
-        )
-        fm_text = result.split("---")[1]
-        fm = yaml.safe_load(fm_text)
-        assert fm.get("context") == "fork"
-        assert fm.get("agent") == "general-purpose"
-
-    def test_disable_model_invocation_override(self, tmp_path):
-        import yaml
-        from specify_cli.agents import CommandRegistrar
-        project_root = self._make_project(tmp_path)
-        registrar = CommandRegistrar()
-        result = registrar.render_skill_command(
-            "claude", "speckit-test-ext-hello",
-            {"description": "Test", "disable-model-invocation": False},
-            "Hello", "test-ext", "commands/hello.md", project_root,
-        )
-        fm_text = result.split("---")[1]
-        fm = yaml.safe_load(fm_text)
-        assert fm.get("disable-model-invocation") is False
-
-    def test_non_passthrough_key_not_leaked(self, tmp_path):
-        import yaml
-        from specify_cli.agents import CommandRegistrar
-        project_root = self._make_project(tmp_path)
-        registrar = CommandRegistrar()
-        result = registrar.render_skill_command(
-            "claude", "speckit-test-ext-hello",
-            {"description": "Test", "scripts": {"sh": "run.sh"}},
-            "Hello", "test-ext", "commands/hello.md", project_root,
-        )
-        fm_text = result.split("---")[1]
-        fm = yaml.safe_load(fm_text)
-        assert "scripts" not in fm
-
-
-class TestBehaviorTranslationInRender:
-    """behavior: and agents: blocks are stripped and translated during rendering."""
-
-    def _render(self, source_frontmatter: dict, body: str = "Hello") -> dict:
-        import yaml
-        import json
-        import tempfile
-        from specify_cli.agents import CommandRegistrar
-        with tempfile.TemporaryDirectory() as tmp:
-            project_root = Path(tmp)
-            (project_root / ".specify").mkdir()
-            (project_root / ".specify" / "init-options.json").write_text(
-                json.dumps({"ai": "claude", "ai_skills": True, "script": "sh"})
-            )
-            registrar = CommandRegistrar()
-            result = registrar.render_skill_command(
-                "claude", "speckit-test-cmd",
-                source_frontmatter, body, "test-ext", "commands/test.md", project_root,
-            )
-        parts = result.split("---")
-        return yaml.safe_load(parts[1])
-
-    def test_behavior_key_stripped_from_output(self):
-        fm = self._render({"description": "Test", "behavior": {"execution": "isolated"}})
-        assert "behavior" not in fm
-
-    def test_agents_key_stripped_from_output(self):
-        fm = self._render({"description": "Test", "agents": {"claude": {"paths": "src/**"}}})
-        assert "agents" not in fm
-
-    def test_execution_isolated_injects_context_fork(self):
-        fm = self._render({"description": "Test", "behavior": {"execution": "isolated"}})
-        assert fm.get("context") == "fork"
-
-    def test_capability_strong_injects_model(self):
-        fm = self._render({"description": "Test", "behavior": {"capability": "strong"}})
-        assert fm.get("model") == "opus"
-
-    def test_effort_high_injected(self):
-        fm = self._render({"description": "Test", "behavior": {"effort": "high"}})
-        assert fm.get("effort") == "high"
-
-    def test_tools_read_only_injects_allowed_tools(self):
-        fm = self._render({"description": "Test", "behavior": {"tools": "read-only"}})
-        assert fm.get("allowed-tools") == "Read Grep Glob"
-
-    def test_invocation_automatic_overrides_default(self):
-        fm = self._render({"description": "Test", "behavior": {"invocation": "automatic"}})
-        assert fm.get("disable-model-invocation") is False
-
-    def test_agents_escape_hatch_applied(self):
-        fm = self._render({
-            "description": "Test",
-            "behavior": {"capability": "fast"},
-            "agents": {"claude": {"model": "claude-opus-4-6", "paths": "src/**"}},
-        })
-        assert fm.get("model") == "claude-opus-4-6"
-        assert fm.get("paths") == "src/**"
-
-    def test_passthrough_wins_over_behavior(self):
-        # Explicit context: fork in source FM (passthrough) should still work alongside behavior
-        fm = self._render({
-            "description": "Test",
-            "context": "fork",
-            "behavior": {"execution": "isolated"},
-        })
-        assert fm.get("context") == "fork"
-
-
-# ===== Agent-Routing Skip in _register_extension_skills =====
-
-class TestExtensionSkillAgentRoutingSkip:
-    """_register_extension_skills() must not create SKILL.md for execution:agent commands."""
-
-    def _make_ext(self, temp_dir: Path, ext_id: str, commands: list) -> Path:
-        ext_dir = temp_dir / ext_id
-        (ext_dir / "commands").mkdir(parents=True)
-        manifest_data = {
-            "schema_version": "1.0",
-            "extension": {
-                "id": ext_id,
-                "name": ext_id,
-                "version": "1.0.0",
-                "description": "Test",
-            },
-            "requires": {"speckit_version": ">=0.1.0"},
-            "provides": {"commands": commands},
-        }
-        with open(ext_dir / "extension.yml", "w") as f:
-            yaml.dump(manifest_data, f)
-        return ext_dir
-
-    def test_agent_command_not_registered_as_skill(self, skills_project, temp_dir):
-        """Command with behavior: execution: agent must not create a SKILL.md."""
-        project_dir, skills_dir = skills_project
-        ext_dir = self._make_ext(temp_dir, "routing-ext", [
-            {
-                "name": "speckit.routing-ext.orchestrator",
-                "file": "commands/orchestrator.md",
-                "description": "Orchestrator command (plain skill)",
-            },
-            {
-                "name": "speckit.routing-ext.specialist",
-                "file": "commands/specialist.md",
-                "description": "Specialist subagent",
-            },
-        ])
-        (ext_dir / "commands" / "orchestrator.md").write_text(
-            "---\ndescription: Orchestrator\nbehavior:\n  invocation: automatic\n---\nOrchestrate.\n"
-        )
-        (ext_dir / "commands" / "specialist.md").write_text(
-            "---\ndescription: Specialist\nbehavior:\n  execution: agent\n---\nYou are a specialist.\n"
-        )
-
-        manager = ExtensionManager(project_dir)
-        manifest = manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
-
-        # orchestrator → SKILL.md created
-        assert (skills_dir / "speckit-routing-ext-orchestrator" / "SKILL.md").exists()
-        # specialist → NO SKILL.md (routed to agents dir instead)
-        assert not (skills_dir / "speckit-routing-ext-specialist" / "SKILL.md").exists()
-
-        metadata = manager.registry.get(manifest.id)
-        assert "speckit-routing-ext-orchestrator" in metadata["registered_skills"]
-        assert "speckit-routing-ext-specialist" not in metadata["registered_skills"]
-
-    def test_agent_command_from_manifest_behavior_not_registered_as_skill(self, skills_project, temp_dir):
-        """execution:agent declared in manifest cmd_info (not source) also skips SKILL.md creation."""
-        project_dir, skills_dir = skills_project
-        ext_dir = self._make_ext(temp_dir, "manifest-routing-ext", [
-            {
-                "name": "speckit.manifest-routing-ext.agent",
-                "file": "commands/agent.md",
-                "description": "Agent from manifest behavior",
-                "behavior": {"execution": "agent"},
-            },
-        ])
-        # Source file has NO frontmatter — pure persona prompt
-        (ext_dir / "commands" / "agent.md").write_text("You are a helpful agent.\n")
-
-        manager = ExtensionManager(project_dir)
-        manifest = manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
-
-        assert not (skills_dir / "speckit-manifest-routing-ext-agent" / "SKILL.md").exists()
-        metadata = manager.registry.get(manifest.id)
-        assert "speckit-manifest-routing-ext-agent" not in metadata["registered_skills"]
-
-    def test_extension_skill_body_paths_rewritten(self, skills_project, temp_dir):
-        """_register_extension_skills rewrites extension-relative paths before placeholder resolution."""
-        project_dir, skills_dir = skills_project
-        ext_dir = self._make_ext(temp_dir, "path-rewrite-ext", [
-            {
-                "name": "speckit.path-rewrite-ext.cmd",
-                "file": "commands/cmd.md",
-                "description": "Command with extension-relative paths",
-            },
-        ])
-        # Create a subdir so rewrite_extension_paths picks it up
-        (ext_dir / "agents").mkdir()
-        (ext_dir / "commands" / "cmd.md").write_text(dedent("""\
-            ---
-            description: Test command
-            ---
-            See agents/control/commander.md for instructions.
-        """))
-
-        manager = ExtensionManager(project_dir)
-        manifest = manager.install_from_directory(ext_dir, "0.1.0", register_commands=False)
-
-        skill_file = skills_dir / "speckit-path-rewrite-ext-cmd" / "SKILL.md"
-        assert skill_file.exists()
-        content = skill_file.read_text()
-        # Path must be rewritten to the installed extension location
-        assert ".specify/extensions/path-rewrite-ext/agents/control/commander.md" in content
-        # Must NOT appear as a bare relative path without the full prefix
-        assert "See agents/control/commander.md" not in content

@@ -6,38 +6,18 @@ Used by both the extension system and the preset system to write
 command files into agent-specific directories in the correct format.
 """
 
-from pathlib import Path
-from typing import Dict, List, Any, Optional
-
+import os
 import platform
 import re
 from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import yaml
 
-from specify_cli.behavior import translate_behavior, strip_behavior_keys, get_deployment_type, get_copilot_tools
-
-
-# Agent-specific frontmatter keys that extension/preset authors may declare in
-# source command frontmatter and have passed through verbatim to the generated
-# skill file.  Keys not in this set are ignored during skill rendering.
-_SKILL_PASSTHROUGH_KEYS: dict[str, frozenset[str]] = {
-    "claude": frozenset({
-        "context",                    # fork execution model
-        "agent",                      # subagent type when context: fork
-        "model",                      # model override
-        "effort",                     # effort level
-        "allowed-tools",              # tool restriction list
-        "color",                      # UI color in Claude Code task list
-        "paths",                      # path-based activation glob
-        "argument-hint",              # UI hint in slash-command menu
-        "disable-model-invocation",   # override default True
-        "user-invocable",             # override default True
-    }),
-    "codex": frozenset({
-        "model",
-        "effort",
-    }),
-}
+from .behavior import get_deployment_type, strip_behavior_keys, translate_behavior
+from ._init_options import is_ai_skills_enabled, load_init_options
+from ._utils import relative_extension_path_violation
 
 
 def _build_agent_configs() -> dict[str, Any]:
@@ -49,7 +29,18 @@ def _build_agent_configs() -> dict[str, Any]:
         if key == "generic":
             continue
         if integration.registrar_config:
-            configs[key] = dict(integration.registrar_config)
+            config = dict(integration.registrar_config)
+            # Propagate invoke_separator from the integration class when the
+            # registrar_config dict doesn't already declare it explicitly.
+            # SkillsIntegration subclasses (claude, codex, …) set
+            # invoke_separator="-" as a class attribute but omit it from
+            # registrar_config, so without this they would fall back to "."
+            # when register_commands() resolves __SPECKIT_COMMAND_*__ tokens.
+            if "invoke_separator" not in config:
+                config["invoke_separator"] = integration.invoke_separator
+            if integration.dev_no_symlink:
+                config["dev_no_symlink"] = True
+            configs[key] = config
     return configs
 
 
@@ -81,6 +72,33 @@ class CommandRegistrar:
                 cls._configs_loaded = True
             except ImportError:
                 pass  # Circular import during module init; retry on next access
+
+    @staticmethod
+    def _hyphenate_frontmatter_refs(val: Any) -> Any:
+        """Recursively find any dotted references starting with speckit. and hyphenate them."""
+        if isinstance(val, dict):
+            return {
+                k: CommandRegistrar._hyphenate_frontmatter_refs(v)
+                for k, v in val.items()
+            }
+        elif isinstance(val, list):
+            return [CommandRegistrar._hyphenate_frontmatter_refs(x) for x in val]
+        elif isinstance(val, str):
+            return re.sub(
+                r"\bspeckit\.[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]+)*\b",
+                lambda m: m.group(0).replace(".", "-"),
+                val,
+            )
+        return val
+
+    @staticmethod
+    def _hyphenate_body_refs(body: str) -> str:
+        """Hyphenate dotted speckit references in command body text."""
+        return re.sub(
+            r"\bspeckit\.[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]+)*\b",
+            lambda m: m.group(0).replace(".", "-"),
+            body,
+        )
 
     @staticmethod
     def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -135,9 +153,9 @@ class CommandRegistrar:
         """Normalize script paths in frontmatter to generated project locations.
 
         Rewrites known repo-relative and top-level script paths under the
-        `scripts` and `agent_scripts` keys (for example `../../scripts/`,
-        `../../templates/`, `../../memory/`, `scripts/`, `templates/`, and
-        `memory/`) to the `.specify/...` paths used in generated projects.
+        ``scripts`` key (for example ``../../scripts/``,
+        ``../../templates/``, ``../../memory/``, ``scripts/``, ``templates/``, and
+        ``memory/``) to the ``.specify/...`` paths used in generated projects.
 
         Args:
             frontmatter: Frontmatter dictionary
@@ -147,11 +165,8 @@ class CommandRegistrar:
         """
         frontmatter = deepcopy(frontmatter)
 
-        for script_key in ("scripts", "agent_scripts"):
-            scripts = frontmatter.get(script_key)
-            if not isinstance(scripts, dict):
-                continue
-
+        scripts = frontmatter.get("scripts")
+        if isinstance(scripts, dict):
             for key, script_path in scripts.items():
                 if isinstance(script_path, str):
                     scripts[key] = self.rewrite_project_relative_paths(script_path)
@@ -184,46 +199,27 @@ class CommandRegistrar:
 
     @staticmethod
     def rewrite_extension_paths(text: str, extension_id: str, extension_dir: Path) -> str:
-        """Rewrite extension-relative paths to their installed project locations.
-
-        Extension command bodies reference files using paths relative to the
-        extension root (e.g. ``agents/control/commander.md``).  After install,
-        those files live at ``.specify/extensions/<id>/...``.  This method
-        rewrites such references so that AI agents can locate them after install.
-
-        Only directories that actually exist inside *extension_dir* are rewritten,
-        keeping the behaviour conservative and avoiding false positives on prose.
-
-        Args:
-            text: Body text of the command file.
-            extension_id: The extension identifier (e.g. ``"echelon"``).
-            extension_dir: Path to the installed extension directory.
-
-        Returns:
-            Body text with extension-relative paths expanded.
-        """
+        """Rewrite extension-relative body paths to installed extension locations."""
         if not isinstance(text, str) or not text:
             return text
 
-        _SKIP = {"commands", ".git", "specs"}
         try:
             subdirs = [
                 d.name
                 for d in extension_dir.iterdir()
-                if d.is_dir() and d.name not in _SKIP and not d.name.startswith(".")
+                if d.is_dir()
+                and d.name not in {"commands", ".git", "specs"}
+                and not d.name.startswith(".")
             ]
         except OSError:
             return text
 
         base_prefix = f".specify/extensions/{extension_id}/"
-
-        # Replace $EXTENSION_PATH shell variable with the actual installed path.
         text = text.replace("$EXTENSION_PATH", base_prefix.rstrip("/"))
 
         for subdir in subdirs:
-            escaped = re.escape(subdir)
             text = re.sub(
-                r"(^|[\s`\"'(])(?:\.?/)?" + escaped + r"/",
+                r"(^|[\s`\"'(])(?:\.?/)?" + re.escape(subdir) + r"/",
                 r"\1" + base_prefix + subdir + "/",
                 text,
             )
@@ -270,9 +266,14 @@ class CommandRegistrar:
         toml_lines.append(f"# Source: {source_id}")
         toml_lines.append("")
 
-        # Keep TOML output valid even when body contains triple-quote delimiters.
-        # Prefer multiline forms, then fall back to escaped basic string.
-        if '"""' not in body:
+        # Keep TOML output valid even when body contains triple-quote delimiters
+        # or backslashes. Prefer multiline forms, then fall back to escaped basic
+        # string. A multiline *basic* string ("""...""") processes backslash escape
+        # sequences, so a body containing a backslash (e.g. a Windows path
+        # ``C:\\Users\\...`` whose ``\\U`` reads as an invalid unicode escape) would
+        # produce unparseable TOML — route those to the *literal* form ('''...'''),
+        # which does not process escapes, or to the escaped basic string.
+        if '"""' not in body and "\\" not in body:
             toml_lines.append('prompt = """')
             toml_lines.append(body)
             toml_lines.append('"""')
@@ -335,58 +336,45 @@ class CommandRegistrar:
     def render_agent_definition(
         self,
         agent_name: str,
-        skill_name: str,
+        agent_name_on_disk: str,
         frontmatter: dict,
         body: str,
-        source_id: str,
-        source_file: str,
-        project_root: Path,
-        source_dir: Optional[Path] = None,
     ) -> str:
-        """Render a command as a Claude agent definition file (.claude/agents/{name}.md).
-
-        Agent definitions differ from skills:
-        - Body is the system prompt, not a task prompt
-        - Frontmatter is minimal: name, description, and behavior-derived fields
-        - No user-invocable, disable-model-invocation, context, or metadata keys
-        """
+        """Render a command body as a Claude agent definition."""
         if not isinstance(frontmatter, dict):
             frontmatter = {}
 
-        if source_dir is not None and (source_dir / "extension.yml").exists():
-            body = self.rewrite_extension_paths(body, source_id, source_dir)
-
-        behavior = frontmatter.get("behavior") or {}
-        agents_overrides = frontmatter.get("agents") or {}
-        behavior_fields: dict = {}
-        if isinstance(behavior, dict):
-            behavior_fields = translate_behavior(
-                agent_name, behavior,
-                agents_overrides if isinstance(agents_overrides, dict) else {}
-            )
-
+        behavior = frontmatter.get("behavior")
+        behavior_fields = translate_behavior(
+            agent_name,
+            behavior if isinstance(behavior, dict) else {},
+            frontmatter.get("agents"),
+        )
         clean_frontmatter = strip_behavior_keys(frontmatter)
-        description = clean_frontmatter.get("description", f"Spec-kit agent: {skill_name}")
+        description = clean_frontmatter.get(
+            "description", f"Spec-kit agent: {agent_name_on_disk}"
+        )
 
-        # Agent definition frontmatter: minimal set, no skill-specific keys
-        agent_fm: dict = {
-            "name": skill_name,
+        agent_frontmatter: dict[str, Any] = {
+            "name": agent_name_on_disk,
             "description": description,
         }
+        for key, value in behavior_fields.items():
+            if key == "allowed-tools":
+                agent_frontmatter["tools"] = value
+            elif key not in {
+                "disable-model-invocation",
+                "user-invocable",
+                "context",
+                "agent",
+            }:
+                agent_frontmatter[key] = value
 
-        # Merge behavior-translated fields; remap allowed-tools → tools for agent defs
-        for k, v in behavior_fields.items():
-            if k == "allowed-tools":
-                agent_fm["tools"] = v
-            elif k not in {"disable-model-invocation", "user-invocable", "context", "agent"}:
-                agent_fm[k] = v
-
-        # Explicit model/tools in source frontmatter win
-        for key in ("model", "tools"):
+        for key in ("model", "tools", "color"):
             if key in clean_frontmatter:
-                agent_fm[key] = clean_frontmatter[key]
+                agent_frontmatter[key] = clean_frontmatter[key]
 
-        return self.render_frontmatter(agent_fm) + "\n" + body
+        return self.render_frontmatter(agent_frontmatter) + "\n" + body
 
     def render_skill_command(
         self,
@@ -397,7 +385,6 @@ class CommandRegistrar:
         source_id: str,
         source_file: str,
         project_root: Path,
-        source_dir: Optional[Path] = None,
     ) -> str:
         """Render a command override as a SKILL.md file.
 
@@ -414,46 +401,22 @@ class CommandRegistrar:
         if not isinstance(frontmatter, dict):
             frontmatter = {}
 
-        if source_dir is not None and (source_dir / "extension.yml").exists():
-            body = self.rewrite_extension_paths(body, source_id, source_dir)
-
-        if agent_name in {"codex", "kimi"}:
+        agent_config = self.AGENT_CONFIGS.get(agent_name, {})
+        if agent_config.get("extension") == "/SKILL.md":
             body = self.resolve_skill_placeholders(
                 agent_name, frontmatter, body, project_root
             )
 
-        # Extract and translate behavior + agents escape hatch
-        behavior = frontmatter.get("behavior") or {}
-        agents_overrides = frontmatter.get("agents") or {}
-        behavior_fields: dict = {}
-        if isinstance(behavior, dict):
-            behavior_fields = translate_behavior(
-                agent_name, behavior,
-                agents_overrides if isinstance(agents_overrides, dict) else {}
-            )
-
-        # Strip behavior/agents keys before building skill frontmatter
-        clean_frontmatter = strip_behavior_keys(frontmatter)
-
-        description = clean_frontmatter.get("description", f"Spec-kit workflow command: {skill_name}")
+        description = frontmatter.get(
+            "description", f"Spec-kit workflow command: {skill_name}"
+        )
         skill_frontmatter = self.build_skill_frontmatter(
             agent_name,
             skill_name,
             description,
             f"{source_id}:{source_file}",
-            source_frontmatter=clean_frontmatter,
+            source_frontmatter=frontmatter,
         )
-        # Merge behavior translation — passthrough (already in skill_frontmatter) wins
-        # because we only set behavior fields if they are not already set via passthrough,
-        # EXCEPT for the set of fields that behavior can legitimately override defaults for.
-        # Only the two boolean defaults injected by build_skill_frontmatter may be
-        # overridden by behavior translation.  Content fields (model, effort, context,
-        # agent, allowed-tools) set explicitly in source frontmatter must win.
-        _behavior_overridable = {"disable-model-invocation", "user-invocable"}
-        for k, v in behavior_fields.items():
-            if k not in skill_frontmatter or k in _behavior_overridable:
-                skill_frontmatter[k] = v
-
         return self.render_frontmatter(skill_frontmatter) + "\n" + body
 
     @staticmethod
@@ -464,20 +427,8 @@ class CommandRegistrar:
         source: str,
         source_frontmatter: dict | None = None,
     ) -> dict:
-        """Build consistent SKILL.md frontmatter across all skill generators.
-
-        Args:
-            agent_name: Target agent key (e.g. "claude", "codex").
-            skill_name: Generated skill name (e.g. "speckit-revenge-extract").
-            description: Human-readable description.
-            source: Source tracking string (e.g. "revenge:commands/extract.md").
-            source_frontmatter: Original command frontmatter. Keys present in
-                ``_SKILL_PASSTHROUGH_KEYS[agent_name]`` are merged after
-                defaults, allowing source authors to override injected values.
-        """
-        source_frontmatter = source_frontmatter or {}
-
-        skill_frontmatter: dict = {
+        """Build consistent SKILL.md frontmatter across all skill generators."""
+        skill_frontmatter = {
             "name": skill_name,
             "description": description,
             "compatibility": "Requires spec-kit project structure with .specify/ directory",
@@ -486,36 +437,68 @@ class CommandRegistrar:
                 "source": source,
             },
         }
-        if agent_name == "claude":
-            skill_frontmatter["user-invocable"] = True
-            skill_frontmatter["disable-model-invocation"] = True
-
-        # Merge passthrough keys from source (wins over defaults above)
-        for key in _SKILL_PASSTHROUGH_KEYS.get(agent_name, frozenset()):
-            if key in source_frontmatter:
-                skill_frontmatter[key] = source_frontmatter[key]
-
+        if isinstance(source_frontmatter, dict):
+            clean_frontmatter = strip_behavior_keys(source_frontmatter)
+            behavior = source_frontmatter.get("behavior")
+            behavior_fields = translate_behavior(
+                agent_name,
+                behavior if isinstance(behavior, dict) else {},
+                source_frontmatter.get("agents"),
+            )
+            skill_frontmatter.update(behavior_fields)
+            for key in (
+                "model",
+                "effort",
+                "context",
+                "agent",
+                "allowed-tools",
+                "tools",
+                "user-invocable",
+                "disable-model-invocation",
+                "color",
+            ):
+                if key in clean_frontmatter:
+                    skill_frontmatter[key] = clean_frontmatter[key]
         return skill_frontmatter
+
+    @staticmethod
+    def apply_argument_hint(
+        source_frontmatter: Dict[str, Any],
+        skill_frontmatter: Dict[str, Any],
+        integration: Optional[object] = None,
+    ) -> None:
+        """Carry a command's ``argument-hint`` into its generated skill frontmatter.
+
+        Copies ``argument-hint`` from the parsed source command frontmatter into
+        *skill_frontmatter* (mutated in place) before serialization, so that a
+        folded multi-line ``description`` cannot be split into invalid YAML. Only
+        integrations that support the field — those exposing
+        ``inject_argument_hint`` (currently Claude) — receive the key, leaving
+        :meth:`build_skill_frontmatter`'s shared shape unchanged for every other
+        agent. Built-in templates carry no ``argument-hint``, so this is a no-op
+        for the core path.
+        """
+        if not isinstance(source_frontmatter, dict) or not isinstance(skill_frontmatter, dict):
+            return
+        argument_hint = source_frontmatter.get("argument-hint")
+        if (
+            argument_hint
+            and integration is not None
+            and hasattr(integration, "inject_argument_hint")
+        ):
+            skill_frontmatter["argument-hint"] = str(argument_hint)
 
     @staticmethod
     def resolve_skill_placeholders(
         agent_name: str, frontmatter: dict, body: str, project_root: Path
     ) -> str:
         """Resolve script placeholders for skills-backed agents."""
-        try:
-            from . import load_init_options
-        except ImportError:
-            return body
-
         if not isinstance(frontmatter, dict):
             frontmatter = {}
 
         scripts = frontmatter.get("scripts", {}) or {}
-        agent_scripts = frontmatter.get("agent_scripts", {}) or {}
         if not isinstance(scripts, dict):
             scripts = {}
-        if not isinstance(agent_scripts, dict):
-            agent_scripts = {}
 
         init_opts = load_init_options(project_root)
         if not isinstance(init_opts, dict):
@@ -529,15 +512,12 @@ class CommandRegistrar:
             )
             secondary_variant = "sh" if default_variant == "ps" else "ps"
 
-            if default_variant in scripts or default_variant in agent_scripts:
+            if default_variant in scripts:
                 fallback_order.append(default_variant)
-            if secondary_variant in scripts or secondary_variant in agent_scripts:
+            if secondary_variant in scripts:
                 fallback_order.append(secondary_variant)
 
             for key in scripts:
-                if key not in fallback_order:
-                    fallback_order.append(key)
-            for key in agent_scripts:
                 if key not in fallback_order:
                     fallback_order.append(key)
 
@@ -548,14 +528,8 @@ class CommandRegistrar:
             script_command = script_command.replace("{ARGS}", "$ARGUMENTS")
             body = body.replace("{SCRIPT}", script_command)
 
-        agent_script_command = (
-            agent_scripts.get(script_variant) if script_variant else None
-        )
-        if agent_script_command:
-            agent_script_command = agent_script_command.replace("{ARGS}", "$ARGUMENTS")
-            body = body.replace("{AGENT_SCRIPT}", agent_script_command)
-
         body = body.replace("{ARGS}", "$ARGUMENTS").replace("__AGENT__", agent_name)
+
         return CommandRegistrar.rewrite_project_relative_paths(body)
 
     def _convert_argument_placeholder(
@@ -579,6 +553,9 @@ class CommandRegistrar:
     ) -> str:
         """Compute the on-disk command or skill name for an agent."""
         if agent_config["extension"] != "/SKILL.md":
+            format_name = agent_config.get("format_name")
+            if format_name:
+                return format_name(cmd_name)
             return cmd_name
 
         short_name = cmd_name
@@ -588,6 +565,56 @@ class CommandRegistrar:
 
         return f"speckit-{short_name}"
 
+    @staticmethod
+    def _ensure_inside(candidate: Path, base: Path) -> None:
+        """Validate that a write target stays within the expected base directory.
+
+        Uses lexical normalization so traversal via ``..`` or absolute paths is
+        rejected while intentionally symlinked sub-directories remain
+        supported.
+
+        Args:
+            candidate: Path that will be written.
+            base: Directory the write must remain within.
+
+        Raises:
+            ValueError: If the normalized candidate path escapes ``base``.
+        """
+        normalized = Path(os.path.normpath(candidate))
+        base_normalized = Path(os.path.normpath(base))
+        if not normalized.is_relative_to(base_normalized):
+            raise ValueError(f"Output path {candidate!r} escapes directory {base!r}")
+
+    @staticmethod
+    def _is_safe_command_name(name: str) -> bool:
+        """Reject names that could escape the commands directory via path traversal."""
+        if os.path.sep in name or "/" in name or "\\" in name:
+            return False
+        return os.path.normpath(name) == name
+
+    @staticmethod
+    def _same_lexical_path(left: Path, right: Path) -> bool:
+        """Compare paths after lexical normalization without resolving symlinks."""
+        return os.path.normcase(os.path.normpath(os.fspath(left))) == os.path.normcase(
+            os.path.normpath(os.fspath(right))
+        )
+
+    @staticmethod
+    def _active_skills_agent(project_root: Path) -> Optional[str]:
+        """Return the initialized skills-backed agent, if skills mode is active."""
+        opts = load_init_options(project_root)
+        if not isinstance(opts, dict):
+            return None
+
+        agent = opts.get("ai")
+        if not isinstance(agent, str) or not agent:
+            return None
+        # Kimi is a native skills integration; when ai_skills is not boolean
+        # True, Kimi still uses its existing SKILL.md layout.
+        if not is_ai_skills_enabled(opts) and agent != "kimi":
+            return None
+        return agent
+
     def register_commands(
         self,
         agent_name: str,
@@ -596,6 +623,8 @@ class CommandRegistrar:
         source_dir: Path,
         project_root: Path,
         context_note: str = None,
+        _resolved_dir: Path = None,
+        link_outputs: bool = False,
     ) -> List[str]:
         """Register commands for a specific agent.
 
@@ -606,6 +635,13 @@ class CommandRegistrar:
             source_dir: Directory containing command source files
             project_root: Path to project root
             context_note: Custom context comment for markdown output
+            _resolved_dir: Pre-resolved command directory (internal use
+                only — avoids a second ``_resolve_agent_dir`` call and
+                duplicate deprecation warnings when invoked from
+                ``register_commands_for_all_agents``).
+            link_outputs: If True, write rendered output to a source-local
+                dev cache and symlink the agent command file to it. Falls back
+                to a normal file write when symlinks are unavailable.
 
         Returns:
             List of registered command names
@@ -618,40 +654,65 @@ class CommandRegistrar:
             raise ValueError(f"Unsupported agent: {agent_name}")
 
         agent_config = self.AGENT_CONFIGS[agent_name]
-        commands_dir = project_root / agent_config["dir"]
+        commands_dir = _resolved_dir or self._resolve_agent_dir(
+            agent_name, agent_config, project_root,
+        )
         commands_dir.mkdir(parents=True, exist_ok=True)
 
         registered = []
+        is_cline_ext = agent_name == "cline" and source_id != "core"
+        source_root = source_dir.resolve()
 
         for cmd_info in commands:
             cmd_name = cmd_info["name"]
+            aliases = cmd_info.get("aliases", [])
             cmd_file = cmd_info["file"]
 
-            source_file = source_dir / cmd_file
-            if not source_file.exists():
+            # Guard against path traversal using the single shared policy in
+            # relative_extension_path_violation(), so the runtime guard stays
+            # aligned with ExtensionManifest._validate() and the skill/preset
+            # readers. Skip a malformed/unsafe ``file`` (non-string, empty,
+            # whitespace, absolute/anchored, or ``..`` traversal); the
+            # resolve()/relative_to() check below is the final containment
+            # backstop.
+            if relative_extension_path_violation(cmd_file):
+                continue
+            try:
+                source_file = (source_root / cmd_file).resolve()
+                source_file.relative_to(source_root)  # raises ValueError if outside
+            except (OSError, ValueError):
                 continue
 
-            content = source_file.read_text(encoding="utf-8")
+            if not source_file.is_file():
+                continue
+
+            try:
+                content = source_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                import warnings
+
+                warnings.warn(
+                    f"Skipping command '{cmd_name}': could not read source file "
+                    f"'{cmd_file}' ({exc.__class__.__name__}: {exc}).",
+                    stacklevel=2,
+                )
+                continue
             frontmatter, body = self.parse_frontmatter(content)
 
-            # Merge manifest-level fields into frontmatter.
-            # For scalar fields (description, agents): source file wins — only
-            # apply manifest value when source has none.
-            # For behavior: dict-merge so extension.yml can augment source
-            # behavior (e.g. add color, effort) without replacing keys the
-            # source file already declares (e.g. invocation).
-            for key in ("description", "agents"):
-                if key in cmd_info and key not in frontmatter:
-                    frontmatter[key] = cmd_info[key]
-            if "behavior" in cmd_info:
-                manifest_behavior = cmd_info["behavior"]
-                if isinstance(manifest_behavior, dict):
-                    source_behavior = frontmatter.get("behavior")
-                    if isinstance(source_behavior, dict):
-                        # Manifest keys fill gaps; source keys win on conflict
-                        frontmatter["behavior"] = {**manifest_behavior, **source_behavior}
-                    else:
-                        frontmatter["behavior"] = manifest_behavior
+            if frontmatter.get("strategy") == "wrap":
+                from .presets import _substitute_core_template
+
+                body, core_frontmatter = _substitute_core_template(
+                    body, cmd_name, project_root, self
+                )
+                frontmatter = dict(frontmatter)
+                for key in ("scripts", "agent_scripts"):
+                    if key not in frontmatter and key in core_frontmatter:
+                        frontmatter[key] = core_frontmatter[key]
+                frontmatter.pop("strategy", None)
+
+            if (source_dir / "extension.yml").is_file():
+                body = self.rewrite_extension_paths(body, source_id, source_dir)
 
             frontmatter = self._adjust_script_paths(frontmatter)
 
@@ -663,38 +724,58 @@ class CommandRegistrar:
                 format_name = agent_config.get("format_name")
                 frontmatter["name"] = format_name(cmd_name) if format_name else cmd_name
 
+            if is_cline_ext:
+                frontmatter = self._hyphenate_frontmatter_refs(frontmatter)
+                body = self._hyphenate_body_refs(body)
+
             body = self._convert_argument_placeholder(
                 body, "$ARGUMENTS", agent_config["args"]
             )
 
+            # Resolve __SPECKIT_COMMAND_*__ tokens using the agent's invoke separator.
+            # The separator is sourced from agent_config (populated by _build_agent_configs,
+            # which propagates each integration's invoke_separator class attribute).
+            # Deferred import of IntegrationBase avoids a circular import at module load
+            # (base.py itself imports CommandRegistrar lazily).
+            from specify_cli.integrations.base import IntegrationBase  # noqa: PLC0415
+
+            _sep = agent_config.get("invoke_separator", ".")
+            body = IntegrationBase.resolve_command_refs(body, _sep)
+
             output_name = self._compute_output_name(agent_name, cmd_name, agent_config)
 
-            # Deployment target is fully derived from behavior.execution
-            cmd_type = get_deployment_type(frontmatter)
-
-            if cmd_type == "agent" and agent_name == "claude":
+            if agent_name == "claude" and get_deployment_type(frontmatter) == "agent":
                 output = self.render_agent_definition(
-                    agent_name, output_name, frontmatter, body,
-                    source_id, cmd_file, project_root, source_dir=source_dir,
+                    agent_name,
+                    output_name,
+                    frontmatter,
+                    body,
                 )
                 agents_dir = project_root / ".claude" / "agents"
-                agents_dir.mkdir(parents=True, exist_ok=True)
                 dest_file = agents_dir / f"{output_name}.md"
+                self._ensure_inside(dest_file, agents_dir)
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
                 dest_file.write_text(output, encoding="utf-8")
                 registered.append(cmd_name)
-                # Also generate agent definition files for any aliases
-                for alias in cmd_info.get("aliases", []):
-                    alias_output_name = self._compute_output_name(agent_name, alias, agent_config)
+
+                for alias in aliases:
+                    alias_output_name = self._compute_output_name(
+                        agent_name, alias, agent_config
+                    )
                     alias_frontmatter = deepcopy(frontmatter)
                     alias_frontmatter["name"] = alias_output_name
                     alias_output = self.render_agent_definition(
-                        agent_name, alias_output_name, alias_frontmatter, body,
-                        source_id, cmd_file, project_root, source_dir=source_dir,
+                        agent_name,
+                        alias_output_name,
+                        alias_frontmatter,
+                        body,
                     )
                     alias_file = agents_dir / f"{alias_output_name}.md"
+                    self._ensure_inside(alias_file, agents_dir)
+                    alias_file.parent.mkdir(parents=True, exist_ok=True)
                     alias_file.write_text(alias_output, encoding="utf-8")
                     registered.append(alias)
-                continue  # skip normal skill/command rendering
+                continue
 
             if agent_config["extension"] == "/SKILL.md":
                 output = self.render_skill_command(
@@ -705,30 +786,24 @@ class CommandRegistrar:
                     source_id,
                     cmd_file,
                     project_root,
-                    source_dir=source_dir,
                 )
             elif agent_config["format"] == "markdown":
-                # For Copilot, translate any behavior: block into agent-native fields.
-                # This covers execution:agent, execution:isolated (→ mode:agent), and
-                # any other behavior keys with a Copilot translation.  Without this,
-                # behavior:/agents: keys would leak into the generated .agent.md file.
-                behavior = frontmatter.get("behavior") if isinstance(frontmatter.get("behavior"), dict) else {}
-                if agent_name == "copilot" and behavior:
-                    agents_overrides = frontmatter.get("agents") or {}
-                    extra_fields = translate_behavior(
-                        agent_name, behavior,
-                        agents_overrides if isinstance(agents_overrides, dict) else {}
-                    )
-                    copilot_tools = get_copilot_tools(behavior)
-                    if copilot_tools:
-                        extra_fields["tools"] = copilot_tools
-                    # Build modified frontmatter: strip internal keys, add extra
-                    copilot_fm = strip_behavior_keys(frontmatter)
-                    copilot_fm.update(extra_fields)
-                    output = self.render_markdown_command(copilot_fm, body, source_id, context_note)
-                else:
-                    output = self.render_markdown_command(frontmatter, body, source_id, context_note)
+                body = self.resolve_skill_placeholders(
+                    agent_name, frontmatter, body, project_root
+                )
+                body = self._convert_argument_placeholder(
+                    body, "$ARGUMENTS", agent_config["args"]
+                )
+                output = self.render_markdown_command(
+                    frontmatter, body, source_id, context_note
+                )
             elif agent_config["format"] == "toml":
+                body = self.resolve_skill_placeholders(
+                    agent_name, frontmatter, body, project_root
+                )
+                body = self._convert_argument_placeholder(
+                    body, "$ARGUMENTS", agent_config["args"]
+                )
                 output = self.render_toml_command(frontmatter, body, source_id)
             elif agent_config["format"] == "yaml":
                 output = self.render_yaml_command(
@@ -738,15 +813,25 @@ class CommandRegistrar:
                 raise ValueError(f"Unsupported format: {agent_config['format']}")
 
             dest_file = commands_dir / f"{output_name}{agent_config['extension']}"
+            self._ensure_inside(dest_file, commands_dir)
             dest_file.parent.mkdir(parents=True, exist_ok=True)
-            dest_file.write_text(output, encoding="utf-8")
+            self._write_registered_output(
+                dest_file,
+                output,
+                source_dir,
+                agent_name,
+                output_name,
+                agent_config["extension"],
+                link_outputs,
+                agent_config,
+            )
 
             if agent_name == "copilot":
                 self.write_copilot_prompt(project_root, cmd_name)
 
             registered.append(cmd_name)
 
-            for alias in cmd_info.get("aliases", []):
+            for alias in aliases:
                 alias_output_name = self._compute_output_name(
                     agent_name, alias, agent_config
                 )
@@ -769,10 +854,11 @@ class CommandRegistrar:
                             source_id,
                             cmd_file,
                             project_root,
-                            source_dir=source_dir,
                         )
                     elif agent_config["format"] == "markdown":
-                        alias_output = self.render_markdown_command(alias_frontmatter, body, source_id, context_note)
+                        alias_output = self.render_markdown_command(
+                            alias_frontmatter, body, source_id, context_note
+                        )
                     elif agent_config["format"] == "toml":
                         alias_output = self.render_toml_command(
                             alias_frontmatter, body, source_id
@@ -797,25 +883,66 @@ class CommandRegistrar:
                             source_id,
                             cmd_file,
                             project_root,
-                            source_dir=source_dir,
                         )
 
                 alias_file = (
                     commands_dir / f"{alias_output_name}{agent_config['extension']}"
                 )
-                try:
-                    alias_file.resolve().relative_to(commands_dir.resolve())
-                except ValueError:
-                    raise ValueError(
-                        f"Alias output path escapes commands directory: {alias_file!r}"
-                    )
+                self._ensure_inside(alias_file, commands_dir)
                 alias_file.parent.mkdir(parents=True, exist_ok=True)
-                alias_file.write_text(alias_output, encoding="utf-8")
+                self._write_registered_output(
+                    alias_file,
+                    alias_output,
+                    source_dir,
+                    agent_name,
+                    alias_output_name,
+                    agent_config["extension"],
+                    link_outputs,
+                    agent_config,
+                )
                 if agent_name == "copilot":
                     self.write_copilot_prompt(project_root, alias)
                 registered.append(alias)
 
         return registered
+
+    @staticmethod
+    def _write_registered_output(
+        dest_file: Path,
+        content: str,
+        source_dir: Path,
+        agent_name: str,
+        output_name: str,
+        extension: str,
+        link_outputs: bool,
+        agent_config: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a rendered agent artifact, optionally as a dev-mode symlink."""
+        if not link_outputs or (agent_config or {}).get("dev_no_symlink"):
+            if dest_file.is_symlink():
+                dest_file.unlink()
+            dest_file.write_text(content, encoding="utf-8")
+            return
+
+        rel_output = Path(f"{output_name}{extension}")
+        cache_root = source_dir / ".specify-dev" / "agent-commands" / agent_name
+        cache_file = cache_root / rel_output
+        CommandRegistrar._ensure_inside(cache_file, cache_root)
+
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(content, encoding="utf-8")
+            if dest_file.exists() or dest_file.is_symlink():
+                dest_file.unlink()
+            target = os.path.relpath(cache_file, dest_file.parent)
+            os.symlink(target, dest_file)
+        except (OSError, ValueError):
+            # Windows often requires Developer Mode or admin privileges for
+            # symlinks, and relpath can fail across drives. Keep dev installs
+            # functional by falling back to a copy.
+            if dest_file.is_symlink():
+                dest_file.unlink()
+            dest_file.write_text(content, encoding="utf-8")
 
     @staticmethod
     def write_copilot_prompt(project_root: Path, cmd_name: str) -> None:
@@ -828,7 +955,55 @@ class CommandRegistrar:
         prompts_dir = project_root / ".github" / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = prompts_dir / f"{cmd_name}.prompt.md"
+        CommandRegistrar._ensure_inside(prompt_file, prompts_dir)
         prompt_file.write_text(f"---\nagent: {cmd_name}\n---\n", encoding="utf-8")
+
+    @staticmethod
+    def _resolve_agent_dir(
+        agent_name: str,
+        agent_config: dict[str, Any],
+        project_root: Path,
+    ) -> Path:
+        """Return the agent command directory, falling back to legacy_dir.
+
+        Supports project-relative paths (e.g. ``.claude/skills/``),
+        home-relative paths (e.g. ``~/.hermes/skills``), and absolute
+        paths — the ``agent_config["dir"]`` value is resolved verbatim
+        when absolute or starting with ``~/``, or joined with
+        ``project_root`` when relative.
+
+        When the canonical directory does not exist but a ``legacy_dir``
+        is configured and present on disk, returns the legacy path and
+        emits a deprecation warning advising the user to upgrade.
+
+        Integrations that do not declare ``legacy_dir`` get the canonical
+        path unconditionally — no fallback, no warning.
+        """
+        dir_str = agent_config["dir"]
+        if dir_str.startswith("~"):
+            # Use Path.home() + remainder instead of expanduser() so tests
+            # that monkeypatch Path.home() can properly isolate the home dir.
+            # expanduser() uses OS env/user lookup and ignores monkeypatches.
+            agent_dir = Path.home() / dir_str[1:].lstrip("/")
+        else:
+            p = Path(dir_str)
+            agent_dir = p if p.is_absolute() else project_root / p
+        if not agent_dir.exists():
+            legacy = agent_config.get("legacy_dir")
+            if legacy:
+                legacy_dir = project_root / legacy
+                if legacy_dir.exists():
+                    import warnings
+
+                    warnings.warn(
+                        f"Found legacy '{legacy}' directory for "
+                        f"{agent_name}. Run 'specify integration "
+                        f"upgrade {agent_name}' to migrate to "
+                        f"'{agent_config['dir']}'.",
+                        stacklevel=3,
+                    )
+                    return legacy_dir
+        return agent_dir
 
     def register_commands_for_all_agents(
         self,
@@ -837,6 +1012,8 @@ class CommandRegistrar:
         source_dir: Path,
         project_root: Path,
         context_note: str = None,
+        link_outputs: bool = False,
+        create_missing_active_skills_dir: bool = False,
     ) -> Dict[str, List[str]]:
         """Register commands for all detected agents in the project.
 
@@ -846,6 +1023,13 @@ class CommandRegistrar:
             source_dir: Directory containing command source files
             project_root: Path to project root
             context_note: Custom context comment for markdown output
+            link_outputs: If True, create dev-mode symlinks for rendered
+                command files when supported by the OS.
+            create_missing_active_skills_dir: If True, attempt missing-dir
+                recovery only for the active initialized skills-backed agent.
+                Recovery requires active skills mode (or Kimi's existing native
+                skills directory) and is skipped when safe resolution or
+                creation fails.
 
         Returns:
             Dictionary mapping agent names to list of registered commands
@@ -853,10 +1037,91 @@ class CommandRegistrar:
         results = {}
 
         self._ensure_configs()
+        active_skills_agent = (
+            self._active_skills_agent(project_root)
+            if create_missing_active_skills_dir else None
+        )
+        active_skills_dir: Optional[Path] = None
+        if active_skills_agent:
+            active_skills_config = self.AGENT_CONFIGS.get(active_skills_agent)
+            if (
+                active_skills_config
+                and active_skills_config.get("extension") == "/SKILL.md"
+            ):
+                active_skills_dir = self._resolve_agent_dir(
+                    active_skills_agent, active_skills_config, project_root,
+                )
+        active_created_skills_dir: Optional[Path] = None
         for agent_name, agent_config in self.AGENT_CONFIGS.items():
-            agent_dir = project_root / agent_config["dir"]
+            active_skills_output = (
+                agent_name == active_skills_agent
+                and agent_config.get("extension") == "/SKILL.md"
+            )
+            recovered_active_skills_dir: Optional[Path] = None
+            # Check detect_dir first (project-local marker) if configured,
+            # falling back to the resolved dir for output.  This prevents
+            # global dirs (e.g. ~/.hermes/skills) from causing false
+            # detection in every project.
+            detect_dir_str = agent_config.get("detect_dir")
+            if detect_dir_str:
+                detect_path = project_root / detect_dir_str
+                if not detect_path.is_dir():
+                    if not active_skills_output:
+                        continue
+                    try:
+                        from . import resolve_active_skills_dir
 
-            if agent_dir.exists():
+                        recovered_active_skills_dir = (
+                            resolve_active_skills_dir(project_root)
+                        )
+                    except (ValueError, OSError):
+                        continue
+                    if recovered_active_skills_dir is None or not detect_path.is_dir():
+                        continue
+                    active_created_skills_dir = recovered_active_skills_dir
+            agent_dir = self._resolve_agent_dir(
+                agent_name, agent_config, project_root,
+            )
+            shares_active_skills_dir = (
+                active_skills_dir is not None
+                and agent_name != active_skills_agent
+                and agent_config.get("extension") == "/SKILL.md"
+                and self._same_lexical_path(agent_dir, active_skills_dir)
+            )
+            if shares_active_skills_dir:
+                continue
+
+            agent_dir_existed = agent_dir.is_dir()
+            register_missing_active_skills_agent = (
+                not agent_dir_existed
+                and active_skills_output
+            )
+            if register_missing_active_skills_agent:
+                if recovered_active_skills_dir is None:
+                    try:
+                        from . import resolve_active_skills_dir
+
+                        recovered_active_skills_dir = (
+                            resolve_active_skills_dir(project_root)
+                        )
+                    except (ValueError, OSError):
+                        continue
+                    if recovered_active_skills_dir is None:
+                        continue
+                active_created_skills_dir = recovered_active_skills_dir
+            # Shared skill dirs such as .agents/skills should not make
+            # later integrations look detected when the active agent just
+            # recreated the directory during this registration pass.
+            created_by_active_agent = (
+                active_created_skills_dir is not None
+                and self._same_lexical_path(agent_dir, active_created_skills_dir)
+                and agent_name != active_skills_agent
+            )
+            should_register = (
+                agent_dir_existed and not created_by_active_agent
+            ) or register_missing_active_skills_agent
+
+            if should_register:
                 try:
                     registered = self.register_commands(
                         agent_name,
@@ -865,18 +1130,91 @@ class CommandRegistrar:
                         source_dir,
                         project_root,
                         context_note=context_note,
+                        _resolved_dir=agent_dir,
+                        link_outputs=link_outputs,
+                    )
+                    if registered:
+                        results[agent_name] = registered
+                    if register_missing_active_skills_agent:
+                        active_created_skills_dir = (
+                            recovered_active_skills_dir or agent_dir
+                        )
+                except ValueError:
+                    continue
+                except OSError:
+                    if register_missing_active_skills_agent:
+                        continue
+                    raise
+
+        return results
+
+    def register_commands_for_non_skill_agents(
+        self,
+        commands: List[Dict[str, Any]],
+        source_id: str,
+        source_dir: Path,
+        project_root: Path,
+        context_note: Optional[str] = None,
+        link_outputs: bool = False,
+    ) -> Dict[str, List[str]]:
+        """Register commands for all non-skill agents in the project.
+
+        Like register_commands_for_all_agents but skips skill-based agents
+        (those with extension '/SKILL.md'). Used by reconciliation to avoid
+        overwriting properly formatted SKILL.md files.
+
+        Args:
+            commands: List of command info dicts
+            source_id: Identifier of the source
+            source_dir: Directory containing command source files
+            project_root: Path to project root
+            context_note: Custom context comment for markdown output
+            link_outputs: If True, create dev-mode symlinks for rendered
+                command files when supported by the OS.
+
+        Returns:
+            Dictionary mapping agent names to list of registered commands
+        """
+        results = {}
+        self._ensure_configs()
+        for agent_name, agent_config in self.AGENT_CONFIGS.items():
+            if agent_config.get("extension") == "/SKILL.md":
+                continue
+            detect_dir_str = agent_config.get("detect_dir")
+            if detect_dir_str:
+                detect_path = project_root / detect_dir_str
+                if not detect_path.is_dir():
+                    continue
+            agent_dir = self._resolve_agent_dir(
+                agent_name, agent_config, project_root,
+            )
+            if agent_dir.is_dir():
+                try:
+                    registered = self.register_commands(
+                        agent_name,
+                        commands,
+                        source_id,
+                        source_dir,
+                        project_root,
+                        context_note=context_note,
+                        _resolved_dir=agent_dir,
+                        link_outputs=link_outputs,
                     )
                     if registered:
                         results[agent_name] = registered
                 except ValueError:
                     continue
-
         return results
 
     def unregister_commands(
         self, registered_commands: Dict[str, List[str]], project_root: Path
     ) -> None:
         """Remove previously registered command files from agent directories.
+
+        When a ``legacy_dir`` is configured, files are removed from
+        *both* the canonical and the legacy directory so that orphaned
+        commands left behind after an ``integration upgrade`` are
+        cleaned up as well.
 
         Args:
             registered_commands: Dict mapping agent names to command name lists
@@ -888,24 +1226,49 @@ class CommandRegistrar:
                 continue
 
             agent_config = self.AGENT_CONFIGS[agent_name]
-            commands_dir = project_root / agent_config["dir"]
+            commands_dir = self._resolve_agent_dir(
+                agent_name, agent_config, project_root,
+            )
+
+            # Collect all directories to clean: canonical (or resolved
+            # legacy) plus the legacy dir if it exists separately.
+            dirs_to_clean = [commands_dir]
+            legacy = agent_config.get("legacy_dir")
+            if legacy:
+                legacy_dir = project_root / legacy
+                if legacy_dir.exists() and legacy_dir != commands_dir:
+                    dirs_to_clean.append(legacy_dir)
 
             for cmd_name in cmd_names:
                 output_name = self._compute_output_name(
                     agent_name, cmd_name, agent_config
                 )
-                cmd_file = commands_dir / f"{output_name}{agent_config['extension']}"
-                if cmd_file.exists():
-                    cmd_file.unlink()
-                    # For SKILL.md agents each command lives in its own subdirectory
-                    # (e.g. .agents/skills/speckit-ext-cmd/SKILL.md). Remove the
-                    # parent dir when it becomes empty to avoid orphaned directories.
-                    parent = cmd_file.parent
-                    if parent != commands_dir and parent.exists():
+
+                names_to_clean = [output_name]
+                if output_name != cmd_name and self._is_safe_command_name(cmd_name):
+                    names_to_clean.append(cmd_name)
+
+                for target_dir in dirs_to_clean:
+                    for name in names_to_clean:
+                        cmd_file = (
+                            target_dir / f"{name}{agent_config['extension']}"
+                        )
                         try:
-                            parent.rmdir()  # no-op if dir still has other files
-                        except OSError:
-                            pass
+                            self._ensure_inside(cmd_file, target_dir)
+                        except ValueError:
+                            continue
+                        if cmd_file.exists() or cmd_file.is_symlink():
+                            cmd_file.unlink()
+                            # For SKILL.md agents each command lives in its own
+                            # subdirectory (e.g. .agents/skills/speckit-ext-cmd/
+                            # SKILL.md).  Remove the parent dir when it becomes
+                            # empty to avoid orphaned directories.
+                            parent = cmd_file.parent
+                            if parent != target_dir and parent.exists():
+                                try:
+                                    parent.rmdir()
+                                except OSError:
+                                    pass
 
                 if agent_name == "copilot":
                     prompt_file = (
@@ -913,12 +1276,6 @@ class CommandRegistrar:
                     )
                     if prompt_file.exists():
                         prompt_file.unlink()
-
-                # Also try agent definition file (Claude-specific)
-                if agent_name == "claude":
-                    agent_def = project_root / ".claude" / "agents" / f"{output_name}.md"
-                    if agent_def.exists():
-                        agent_def.unlink()
 
 
 # Populate AGENT_CONFIGS after class definition.

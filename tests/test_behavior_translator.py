@@ -1,219 +1,80 @@
-# tests/test_behavior_translator.py
+"""Tests for neutral extension behavior frontmatter translation."""
+
 import pytest
-from specify_cli.behavior import translate_behavior, strip_behavior_keys, get_deployment_type, get_copilot_tools
+
+from specify_cli.behavior import (
+    get_deployment_type,
+    strip_behavior_keys,
+    translate_behavior,
+)
 
 
-class TestTranslateBehavior:
-    def test_execution_isolated_claude(self):
-        result = translate_behavior("claude", {"execution": "isolated"})
-        assert result == {"context": "fork"}
+@pytest.mark.parametrize(
+    ("capability", "model"),
+    [
+        ("fast", "haiku"),
+        ("balanced", "sonnet"),
+        ("strong", "opus"),
+    ],
+)
+def test_translate_claude_capability_uses_versionless_model_alias(
+    capability, model
+):
+    assert translate_behavior("claude", {"capability": capability}) == {
+        "model": model
+    }
 
-    def test_execution_agent_claude_no_frontmatter_key(self):
-        # 'agent' execution type is handled by routing, not frontmatter
-        result = translate_behavior("claude", {"execution": "agent"})
-        assert "context" not in result
 
-    def test_capability_strong_claude(self):
-        result = translate_behavior("claude", {"capability": "strong"})
-        assert result == {"model": "opus"}
-
-    def test_capability_balanced_claude(self):
-        result = translate_behavior("claude", {"capability": "balanced"})
-        assert result == {"model": "sonnet"}
-
-    def test_capability_fast_claude(self):
-        result = translate_behavior("claude", {"capability": "fast"})
-        assert result == {"model": "haiku"}
-
-    def test_effort_high_claude(self):
-        result = translate_behavior("claude", {"effort": "high"})
-        assert result == {"effort": "high"}
-
-    def test_tools_read_only_claude(self):
-        result = translate_behavior("claude", {"tools": "read-only"})
-        assert result == {"allowed-tools": "Read Grep Glob"}
-
-    def test_tools_none_claude(self):
-        result = translate_behavior("claude", {"tools": "none"})
-        assert result == {"allowed-tools": ""}
-
-    def test_tools_full_claude_no_injection(self):
-        result = translate_behavior("claude", {"tools": "full"})
-        assert "allowed-tools" not in result
-
-    def test_invocation_explicit_claude(self):
-        result = translate_behavior("claude", {"invocation": "explicit"})
-        assert result == {"disable-model-invocation": True}
-
-    def test_invocation_automatic_claude(self):
-        result = translate_behavior("claude", {"invocation": "automatic"})
-        assert result == {"disable-model-invocation": False}
-
-    def test_visibility_model_claude(self):
-        result = translate_behavior("claude", {"visibility": "model"})
-        assert result == {"user-invocable": False}
-
-    def test_execution_agent_copilot_no_frontmatter(self):
-        result = translate_behavior("copilot", {"execution": "agent"})
-        assert result == {}
-
-    def test_execution_isolated_copilot_no_frontmatter(self):
-        result = translate_behavior("copilot", {"execution": "isolated"})
-        assert result == {}
-
-    def test_capability_fast_copilot(self):
-        result = translate_behavior("copilot", {"capability": "fast"})
-        assert result == {"model": "Claude Haiku 4.5"}
-
-    def test_capability_balanced_copilot(self):
-        result = translate_behavior("copilot", {"capability": "balanced"})
-        assert result == {"model": "Claude Sonnet 4.5"}
-
-    def test_capability_strong_copilot(self):
-        result = translate_behavior("copilot", {"capability": "strong"})
-        assert result == {"model": "Claude Opus 4.5"}
-
-    def test_invocation_explicit_copilot(self):
-        result = translate_behavior("copilot", {"invocation": "explicit"})
-        assert result == {"disable-model-invocation": True}
-
-    def test_invocation_automatic_copilot(self):
-        result = translate_behavior("copilot", {"invocation": "automatic"})
-        assert result == {"disable-model-invocation": False}
-
-    def test_visibility_user_copilot(self):
-        result = translate_behavior("copilot", {"visibility": "user"})
-        assert result == {"user-invocable": True}
-
-    def test_visibility_model_copilot(self):
-        result = translate_behavior("copilot", {"visibility": "model"})
-        assert result == {"user-invocable": False}
-
-    def test_tools_none_copilot(self):
-        result = translate_behavior("copilot", {"tools": "none"})
-        assert result == {"tools": []}
-
-    def test_tools_read_only_copilot(self):
-        result = translate_behavior("copilot", {"tools": "read-only"})
-        assert result == {"tools": ["read_file", "list_directory", "search_files"]}
-
-    def test_tools_write_copilot(self):
-        result = translate_behavior("copilot", {"tools": "write"})
-        assert result == {"tools": ["*"]}
-
-    def test_tools_full_copilot(self):
-        result = translate_behavior("copilot", {"tools": "full"})
-        assert result == {"tools": ["*"]}
-
-    def test_tools_write_claude(self):
-        result = translate_behavior("claude", {"tools": "write"})
-        assert result == {"allowed-tools": "Read Write Edit Grep Glob"}
-
-    def test_color_passthrough_claude(self):
-        result = translate_behavior("claude", {"color": "blue"})
-        assert result == {"color": "blue"}
-
-    def test_color_any_value_passthrough_claude(self):
-        for color in ("red", "green", "yellow", "purple", "orange", "pink", "cyan"):
-            result = translate_behavior("claude", {"color": color})
-            assert result == {"color": color}
-
-    def test_color_ignored_for_non_claude_agents(self):
-        result = translate_behavior("copilot", {"color": "blue"})
-        assert "color" not in result
-
-    def test_unknown_key_ignored(self):
-        result = translate_behavior("claude", {"unknown-key": "value"})
-        assert result == {}
-
-    def test_unsupported_agent_returns_empty(self):
-        result = translate_behavior("gemini", {"execution": "isolated"})
-        assert result == {}
-
-    def test_agents_escape_hatch_applied(self):
-        result = translate_behavior(
-            "claude",
-            {"capability": "fast"},
-            agents_overrides={"claude": {"model": "claude-opus-4-6", "paths": "src/**"}},
-        )
-        assert result["model"] == "claude-opus-4-6"
-        assert result["paths"] == "src/**"
-
-    def test_agents_escape_hatch_other_agent_ignored(self):
-        result = translate_behavior(
-            "claude",
-            {},
-            agents_overrides={"codex": {"effort": "high"}},
-        )
-        assert result == {}
-
-    def test_multiple_behavior_keys(self):
-        result = translate_behavior("claude", {
-            "execution": "isolated",
-            "capability": "strong",
-            "effort": "max",
+def test_translate_claude_tools_invocation_and_visibility():
+    result = translate_behavior(
+        "claude",
+        {
+            "tools": "read-only",
             "invocation": "explicit",
-        })
-        assert result["context"] == "fork"
-        assert result["model"] == "opus"
-        assert result["effort"] == "max"
-        assert result["disable-model-invocation"] is True
+            "visibility": "model",
+        },
+    )
+
+    assert result == {
+        "allowed-tools": "Read Grep Glob",
+        "disable-model-invocation": True,
+        "user-invocable": False,
+    }
 
 
-class TestStripBehaviorKeys:
-    def test_strips_behavior(self):
-        fm = {"name": "foo", "behavior": {"execution": "isolated"}, "description": "bar"}
-        result = strip_behavior_keys(fm)
-        assert "behavior" not in result
-        assert result["name"] == "foo"
+def test_translate_claude_custom_tool_list():
+    result = translate_behavior("claude", {"tools": ["Read", "Grep", "Bash"]})
 
-    def test_strips_agents(self):
-        fm = {"name": "foo", "agents": {"claude": {"paths": "src/**"}}}
-        result = strip_behavior_keys(fm)
-        assert "agents" not in result
-
-    def test_no_behavior_keys_passthrough(self):
-        fm = {"name": "foo", "description": "bar"}
-        result = strip_behavior_keys(fm)
-        assert result == {"name": "foo", "description": "bar"}
-
-    def test_returns_copy_not_mutating_original(self):
-        fm = {"behavior": {"execution": "isolated"}}
-        result = strip_behavior_keys(fm)
-        assert "behavior" in fm  # original unchanged
+    assert result == {"allowed-tools": "Read Grep Bash"}
 
 
-class TestGetDeploymentType:
-    def test_behavior_execution_agent(self):
-        assert get_deployment_type({"behavior": {"execution": "agent"}}) == "agent"
+def test_translate_copilot_tools_and_agent_override():
+    result = translate_behavior(
+        "copilot",
+        {"tools": "read-only"},
+        {"copilot": {"model": "Claude Sonnet 4.5"}},
+    )
 
-    def test_behavior_execution_isolated_is_command(self):
-        assert get_deployment_type({"behavior": {"execution": "isolated"}}) == "command"
-
-    def test_behavior_execution_command_is_command(self):
-        assert get_deployment_type({"behavior": {"execution": "command"}}) == "command"
-
-    def test_defaults_to_command_when_no_behavior(self):
-        assert get_deployment_type({}) == "command"
-
-    def test_defaults_to_command_when_no_execution(self):
-        assert get_deployment_type({"behavior": {"capability": "strong"}}) == "command"
+    assert result == {
+        "tools": ["read_file", "list_directory", "search_files"],
+        "model": "Claude Sonnet 4.5",
+    }
 
 
-class TestGetCopilotTools:
-    def test_read_only_returns_tools(self):
-        result = get_copilot_tools({"tools": "read-only"})
-        assert "read_file" in result
-        assert "list_directory" in result
+def test_strip_behavior_keys_leaves_other_frontmatter():
+    result = strip_behavior_keys(
+        {
+            "description": "Run a command",
+            "behavior": {"tools": "read-only"},
+            "agents": {"claude": {"model": "claude-opus"}},
+        }
+    )
 
-    def test_full_returns_empty(self):
-        result = get_copilot_tools({"tools": "full"})
-        assert result == []
+    assert result == {"description": "Run a command"}
 
-    def test_none_returns_empty(self):
-        result = get_copilot_tools({"tools": "none"})
-        assert result == []
 
-    def test_missing_tools_defaults_to_full(self):
-        result = get_copilot_tools({})
-        assert result == []
+def test_get_deployment_type_reads_behavior_execution():
+    assert get_deployment_type({"behavior": {"execution": "agent"}}) == "agent"
+    assert get_deployment_type({"behavior": {"execution": "command"}}) == "command"
+    assert get_deployment_type({}) == "command"
+

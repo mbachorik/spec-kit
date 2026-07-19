@@ -10,8 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -33,10 +33,6 @@ env/
 *.swo
 .DS_Store
 *.tmp
-.venv312
-.specify
-.gitignore
-.claude
 
 # Project specific
 *.log
@@ -49,10 +45,17 @@ env/
 *.zip
 sdd-*/
 docs/dev
-specs
-
 
 # Extension system
 .specify/extensions/.cache/
 .specify/extensions/.backup/
 .specify/extensions/*/local-config.yml
+
+# The following directories/file are intentionally ignored so that they are not accidentally
+# committed to the repository. They contain the scaffolding `specify init --integration copilot`
+# does and they are meant for dogfooding Spec Kit during its own feature development.
+.github/agents/
+.github/prompts/
+.github/copilot-instructions.md
+.specify/
+specs/
