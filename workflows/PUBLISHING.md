@@ -62,10 +62,10 @@ requires:
     any: ["claude", "gemini"]      # At least one required
 
 inputs:
-  feature_name:
+  spec:
     type: string
     required: true
-    prompt: "Feature name"
+    prompt: "Describe what you want to build"
   scope:
     type: string
     default: "full"
@@ -75,7 +75,7 @@ steps:
   - id: specify
     command: speckit.specify
     input:
-      args: "{{ inputs.feature_name }}"
+      args: "{{ inputs.spec }}"
 
   - id: review
     type: gate
@@ -99,7 +99,7 @@ steps:
 
 ```bash
 # Run with required inputs
-specify workflow run ./workflow.yml --input feature_name="user-auth"
+specify workflow run ./workflow.yml --input spec="Build a user authentication system with OAuth support"
 
 # Check validation
 specify workflow info ./workflow.yml
@@ -268,9 +268,21 @@ When releasing a new version:
 
 ### Shell Steps
 
+- **Shell runs with the user's privileges** — a `shell` step executes a local command directly; there is no capability sandbox. `requires` is an advisory pre-condition block (recognised keys: `speckit_version`, `integrations`), **not** a runtime permission gate — there is no `requires.permissions`. Gate sensitive commands explicitly with a `gate` step.
 - **Avoid destructive commands** — don't delete files or directories without explicit confirmation via a gate
 - **Quote variables** — use proper quoting in shell commands to handle spaces
 - **Check exit codes** — shell step failures stop the workflow; make sure commands are robust
+
+#### Security: shell steps execute arbitrary code
+
+Workflow `shell` steps execute their `run` field through `/bin/sh` (POSIX) or the platform shell. There is no sandbox between the step and the user's machine: a malicious or buggy `run` block can read environment variables, modify files outside the project, exfiltrate data, or escalate privileges.
+
+Catalog-listed workflows are reviewed at submission time (see [Verification Process](#verification-process)), but you should still treat every install as code-execution from an untrusted source until you have read the `workflow.yml`:
+
+- **Before installing a workflow**, fetch the raw YAML and audit every `shell` step's `run` field directly. `specify workflow info <name>` only shows metadata (name, version, inputs, step IDs/types) — not the shell content that would actually execute.
+- **Prefer explicit commands over interpolation** in `run` blocks: `{{ inputs.something }}` substitutions should be quoted and constrained via `enum` so a malicious input can't inject shell syntax.
+- **Limit privilege**: shell steps inherit the user's environment. Workflows that need elevated access (sudo, secrets, GitHub tokens) should call them out explicitly in the README so reviewers can spot the requirement.
+- **Authors**: if your workflow has shell steps that look risky out of context (deletions, network calls, credential reads), document the rationale in your README. Maintainers will reject submissions whose shell steps can't be justified at review time.
 
 ### Integration Flexibility
 

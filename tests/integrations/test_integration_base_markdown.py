@@ -1,8 +1,8 @@
 """Reusable test mixin for standard MarkdownIntegration subclasses.
 
 Each per-agent test file sets ``KEY``, ``FOLDER``, ``COMMANDS_SUBDIR``,
-``REGISTRAR_DIR``, and ``CONTEXT_FILE``, then inherits all verification
-logic from ``MarkdownIntegrationTests``.
+and ``REGISTRAR_DIR``, then inherits all verification logic from
+``MarkdownIntegrationTests``.
 """
 
 import os
@@ -21,14 +21,12 @@ class MarkdownIntegrationTests:
         FOLDER: str           — e.g. ".claude/"
         COMMANDS_SUBDIR: str  — e.g. "commands"
         REGISTRAR_DIR: str    — e.g. ".claude/commands"
-        CONTEXT_FILE: str     — e.g. "CLAUDE.md"
     """
 
     KEY: str
     FOLDER: str
     COMMANDS_SUBDIR: str
     REGISTRAR_DIR: str
-    CONTEXT_FILE: str
 
     # -- Registration -----------------------------------------------------
 
@@ -55,10 +53,6 @@ class MarkdownIntegrationTests:
         assert i.registrar_config["format"] == "markdown"
         assert i.registrar_config["args"] == "$ARGUMENTS"
         assert i.registrar_config["extension"] == ".md"
-
-    def test_context_file(self):
-        i = get_integration(self.KEY)
-        assert i.context_file == self.CONTEXT_FILE
 
     # -- Setup / teardown -------------------------------------------------
 
@@ -98,8 +92,24 @@ class MarkdownIntegrationTests:
             assert "{SCRIPT}" not in content, f"{f.name} has unprocessed {{SCRIPT}}"
             assert "__AGENT__" not in content, f"{f.name} has unprocessed __AGENT__"
             assert "{ARGS}" not in content, f"{f.name} has unprocessed {{ARGS}}"
+            assert "__SPECKIT_COMMAND_" not in content, f"{f.name} has unprocessed __SPECKIT_COMMAND_*__"
             assert "\nscripts:\n" not in content, f"{f.name} has unstripped scripts: block"
-            assert "\nagent_scripts:\n" not in content, f"{f.name} has unstripped agent_scripts: block"
+
+    def test_plan_command_has_no_context_placeholder(self, tmp_path):
+        """The generated plan command must not carry a context-file placeholder.
+
+        Agent context files are owned entirely by the opt-in agent-context
+        extension, so the core plan command must not reference one.
+        """
+        i = get_integration(self.KEY)
+        m = IntegrationManifest(self.KEY, tmp_path)
+        i.setup(tmp_path, m)
+        plan_file = i.commands_dest(tmp_path) / i.command_filename("plan")
+        assert plan_file.exists(), f"Plan file {plan_file} not created"
+        content = plan_file.read_text(encoding="utf-8")
+        assert "__CONTEXT_FILE__" not in content, (
+            f"Plan command has unprocessed __CONTEXT_FILE__ placeholder in {plan_file.name}"
+        )
 
     def test_all_files_tracked_in_manifest(self, tmp_path):
         i = get_integration(self.KEY)
@@ -132,34 +142,36 @@ class MarkdownIntegrationTests:
         assert modified_file.exists()
         assert modified_file in skipped
 
-    # -- Scripts ----------------------------------------------------------
+    # -- Context file ownership (extension-owned, opt-in) -----------------
 
-    def test_setup_installs_update_context_scripts(self, tmp_path):
-        i = get_integration(self.KEY)
-        m = IntegrationManifest(self.KEY, tmp_path)
-        created = i.setup(tmp_path, m)
-        scripts_dir = tmp_path / ".specify" / "integrations" / self.KEY / "scripts"
-        assert scripts_dir.is_dir(), f"Scripts directory not created for {self.KEY}"
-        assert (scripts_dir / "update-context.sh").exists()
-        assert (scripts_dir / "update-context.ps1").exists()
-
-    def test_scripts_tracked_in_manifest(self, tmp_path):
+    def test_setup_does_not_write_context_section(self, tmp_path):
+        """Setup must not create or manage any agent context file — that is
+        owned entirely by the opt-in agent-context extension."""
         i = get_integration(self.KEY)
         m = IntegrationManifest(self.KEY, tmp_path)
         i.setup(tmp_path, m)
-        script_rels = [k for k in m.files if "update-context" in k]
-        assert len(script_rels) >= 2
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                assert "<!-- SPECKIT START -->" not in text, (
+                    f"Setup wrote a managed context section into {path} for {self.KEY}"
+                )
 
-    def test_sh_script_is_executable(self, tmp_path):
+    def test_teardown_leaves_existing_context_file_intact(self, tmp_path):
+        """A user-authored context file must survive setup + teardown untouched."""
         i = get_integration(self.KEY)
         m = IntegrationManifest(self.KEY, tmp_path)
+        ctx_path = tmp_path / "AGENTS.md"
+        original = "# My Rules\n\nUser content.\n"
+        ctx_path.write_text(original, encoding="utf-8")
         i.setup(tmp_path, m)
-        sh = tmp_path / ".specify" / "integrations" / self.KEY / "scripts" / "update-context.sh"
-        assert os.access(sh, os.X_OK)
+        m.save()
+        i.teardown(tmp_path, m)
+        assert ctx_path.read_text(encoding="utf-8") == original
 
-    # -- CLI auto-promote -------------------------------------------------
+    # -- CLI integration flag -------------------------------------------------
 
-    def test_ai_flag_auto_promotes(self, tmp_path):
+    def test_integration_flag_auto_promotes(self, tmp_path):
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -170,15 +182,15 @@ class MarkdownIntegrationTests:
             os.chdir(project)
             runner = CliRunner()
             result = runner.invoke(app, [
-                "init", "--here", "--ai", self.KEY, "--script", "sh", "--no-git",
+                "init", "--here", "--integration", self.KEY, "--script", "sh",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
-        assert result.exit_code == 0, f"init --ai {self.KEY} failed: {result.output}"
+        assert result.exit_code == 0, f"init --integration {self.KEY} failed: {result.output}"
         i = get_integration(self.KEY)
         cmd_dir = i.commands_dest(project)
-        assert cmd_dir.is_dir(), f"--ai {self.KEY} did not create commands directory"
+        assert cmd_dir.is_dir(), f"--integration {self.KEY} did not create commands directory"
 
     def test_integration_flag_creates_files(self, tmp_path):
         from typer.testing import CliRunner
@@ -191,7 +203,7 @@ class MarkdownIntegrationTests:
             os.chdir(project)
             runner = CliRunner()
             result = runner.invoke(app, [
-                "init", "--here", "--integration", self.KEY, "--script", "sh", "--no-git",
+                "init", "--here", "--integration", self.KEY, "--script", "sh",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
@@ -203,11 +215,12 @@ class MarkdownIntegrationTests:
         commands = sorted(cmd_dir.glob("speckit.*"))
         assert len(commands) > 0, f"No command files in {cmd_dir}"
 
+
     # -- Complete file inventory ------------------------------------------
 
     COMMAND_STEMS = [
-        "analyze", "checklist", "clarify", "constitution",
-        "implement", "plan", "specify", "tasks", "taskstoissues",
+        "analyze", "clarify", "constitution", "converge", "implement",
+        "plan", "checklist", "specify", "tasks", "taskstoissues",
     ]
 
     def _expected_files(self, script_variant: str) -> list[str]:
@@ -220,26 +233,22 @@ class MarkdownIntegrationTests:
         for stem in self.COMMAND_STEMS:
             files.append(f"{cmd_dir}/speckit.{stem}.md")
 
-        # Integration scripts
-        files.append(f".specify/integrations/{self.KEY}/scripts/update-context.ps1")
-        files.append(f".specify/integrations/{self.KEY}/scripts/update-context.sh")
-
         # Framework files
-        files.append(f".specify/integration.json")
-        files.append(f".specify/init-options.json")
+        files.append(".specify/integration.json")
+        files.append(".specify/init-options.json")
         files.append(f".specify/integrations/{self.KEY}.manifest.json")
-        files.append(f".specify/integrations/speckit.manifest.json")
+        files.append(".specify/integrations/speckit.manifest.json")
 
         if script_variant == "sh":
             for name in ["check-prerequisites.sh", "common.sh", "create-new-feature.sh",
-                         "setup-plan.sh", "update-agent-context.sh"]:
+                         "setup-plan.sh", "setup-tasks.sh"]:
                 files.append(f".specify/scripts/bash/{name}")
         else:
             for name in ["check-prerequisites.ps1", "common.ps1", "create-new-feature.ps1",
-                         "setup-plan.ps1", "update-agent-context.ps1"]:
+                         "setup-plan.ps1", "setup-tasks.ps1"]:
                 files.append(f".specify/scripts/powershell/{name}")
 
-        for name in ["agent-file-template.md", "checklist-template.md",
+        for name in ["checklist-template.md",
                      "constitution-template.md", "plan-template.md",
                      "spec-template.md", "tasks-template.md"]:
             files.append(f".specify/templates/{name}")
@@ -248,6 +257,9 @@ class MarkdownIntegrationTests:
         # Bundled workflow
         files.append(".specify/workflows/speckit/workflow.yml")
         files.append(".specify/workflows/workflow-registry.json")
+
+
+
         return sorted(files)
 
     def test_complete_file_inventory_sh(self, tmp_path):
@@ -262,13 +274,13 @@ class MarkdownIntegrationTests:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", self.KEY, "--script", "sh",
-                "--no-git", "--ignore-agent-tools",
+                "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(p.relative_to(project).as_posix()
-                        for p in project.rglob("*") if p.is_file())
+                        for p in project.rglob("*") if p.is_file() and ".git" not in p.parts)
         expected = self._expected_files("sh")
         assert actual == expected, (
             f"Missing: {sorted(set(expected) - set(actual))}\n"
@@ -287,13 +299,13 @@ class MarkdownIntegrationTests:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", self.KEY, "--script", "ps",
-                "--no-git", "--ignore-agent-tools",
+                "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(p.relative_to(project).as_posix()
-                        for p in project.rglob("*") if p.is_file())
+                        for p in project.rglob("*") if p.is_file() and ".git" not in p.parts)
         expected = self._expected_files("ps")
         assert actual == expected, (
             f"Missing: {sorted(set(expected) - set(actual))}\n"
