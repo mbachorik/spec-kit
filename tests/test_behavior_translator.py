@@ -15,11 +15,15 @@ class TestTranslateBehavior:
 
     def test_capability_strong_claude(self):
         result = translate_behavior("claude", {"capability": "strong"})
-        assert result == {"model": "claude-opus-4-6"}
+        assert result == {"model": "opus"}
+
+    def test_capability_balanced_claude(self):
+        result = translate_behavior("claude", {"capability": "balanced"})
+        assert result == {"model": "sonnet"}
 
     def test_capability_fast_claude(self):
         result = translate_behavior("claude", {"capability": "fast"})
-        assert result == {"model": "claude-haiku-4-5-20251001"}
+        assert result == {"model": "haiku"}
 
     def test_effort_high_claude(self):
         result = translate_behavior("claude", {"effort": "high"})
@@ -151,7 +155,7 @@ class TestTranslateBehavior:
             "invocation": "explicit",
         })
         assert result["context"] == "fork"
-        assert result["model"] == "claude-opus-4-6"
+        assert result["model"] == "opus"
         assert result["effort"] == "max"
         assert result["disable-model-invocation"] is True
 

@@ -53,9 +53,9 @@ _TRANSLATIONS: dict[str, dict[str, dict[str, tuple[str | None, object]]]] = {
             "agent": (None, None),   # routing concern, not frontmatter
         },
         "capability": {
-            "fast": ("model", "claude-haiku-4-5-20251001"),
-            "balanced": ("model", "claude-sonnet-4-6"),
-            "strong": ("model", "claude-opus-4-6"),
+            "fast": ("model", "haiku"),
+            "balanced": ("model", "sonnet"),
+            "strong": ("model", "opus"),
         },
         "effort": {
             "low": ("effort", "low"),
