@@ -836,7 +836,7 @@ class TestBehaviorTranslationInRender:
 
     def test_capability_strong_injects_model(self):
         fm = self._render({"description": "Test", "behavior": {"capability": "strong"}})
-        assert fm.get("model") == "claude-opus-4-6"
+        assert fm.get("model") == "opus"
 
     def test_effort_high_injected(self):
         fm = self._render({"description": "Test", "behavior": {"effort": "high"}})

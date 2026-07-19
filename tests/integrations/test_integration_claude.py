@@ -486,7 +486,7 @@ class TestSkillsIntegrationBehaviorTranslation:
         assert fm.get("disable-model-invocation") is True
 
     def test_capability_strong_produces_model_opus(self, tmp_path):
-        """behavior: capability: strong must produce model: claude-opus-4-6 in the skill."""
+        """behavior: capability: strong must produce model: opus in the skill."""
         fm = self._run_claude_setup(tmp_path, dedent("""\
             ---
             description: Strong capability command
@@ -495,7 +495,7 @@ class TestSkillsIntegrationBehaviorTranslation:
             ---
             Body.
         """))
-        assert fm.get("model") == "claude-opus-4-6"
+        assert fm.get("model") == "opus"
 
     def test_behavior_fields_present_before_post_processing(self, tmp_path):
         """Verify behavior fields appear in final SKILL.md alongside user-invocable."""
@@ -510,6 +510,6 @@ class TestSkillsIntegrationBehaviorTranslation:
         """))
         # Both behavior-translated fields must be present
         assert fm.get("disable-model-invocation") is False
-        assert fm.get("model") == "claude-haiku-4-5-20251001"
+        assert fm.get("model") == "haiku"
         # Claude post-processor still injects user-invocable
         assert fm.get("user-invocable") is True

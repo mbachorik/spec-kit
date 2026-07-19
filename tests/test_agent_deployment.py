@@ -97,7 +97,7 @@ class TestClaudeAgentDeployment:
         fm = yaml.safe_load(parts[1])
         assert fm["name"] == "speckit-test-ext-analyzer"
         assert fm["description"] == "Analyze the codebase"
-        assert fm.get("model") == "claude-opus-4-6"        # from capability: strong
+        assert fm.get("model") == "opus"        # from capability: strong
         assert fm.get("tools") == "Read Grep Glob"         # from tools: read-only
         # These must NOT appear in agent definition files
         assert "user-invocable" not in fm
@@ -387,7 +387,7 @@ class TestEndToEnd:
         agent_file = project_root / ".claude" / "agents" / "speckit-revenge-analyzer.md"
         assert agent_file.exists(), "analyzer should deploy as agent definition"
         agent_fm = yaml.safe_load(agent_file.read_text().split("---")[1])
-        assert agent_fm.get("model") == "claude-opus-4-6"      # capability: strong
+        assert agent_fm.get("model") == "opus"      # capability: strong
         assert agent_fm.get("tools") == "Read Grep Glob"        # tools: read-only
         assert "user-invocable" not in agent_fm
         assert "disable-model-invocation" not in agent_fm
@@ -454,7 +454,7 @@ class TestManifestBehaviorMerge:
         )
         skill_file = root / ".claude" / "skills" / "speckit-test-ext-cmd" / "SKILL.md"
         fm = yaml.safe_load(skill_file.read_text().split("---")[1])
-        assert fm.get("model") == "claude-opus-4-6"
+        assert fm.get("model") == "opus"
 
     def test_source_behavior_wins_over_manifest(self, tmp_path):
         """When source file declares behavior, it takes precedence over manifest."""
@@ -503,7 +503,7 @@ class TestManifestBehaviorMerge:
         assert agent_file.exists()
         assert not skill_file.exists()
         fm = yaml.safe_load(agent_file.read_text().split("---")[1])
-        assert fm.get("model") == "claude-sonnet-4-6"   # capability: balanced
+        assert fm.get("model") == "sonnet"   # capability: balanced
 
     def test_agent_aliases_generate_agent_files(self, tmp_path):
         """Aliases on execution:agent commands get their own .claude/agents/<alias>.md files."""
@@ -533,4 +533,3 @@ class TestManifestBehaviorMerge:
         # Alias file should use the alias name in its frontmatter
         fm = yaml.safe_load((agents_dir / "speckit-test-ext-w.md").read_text().split("---")[1])
         assert fm["name"] == "speckit-test-ext-w"
-
