@@ -1,10 +1,28 @@
 """Tests for neutral extension behavior frontmatter translation."""
 
+import pytest
+
 from specify_cli.behavior import (
     get_deployment_type,
     strip_behavior_keys,
     translate_behavior,
 )
+
+
+@pytest.mark.parametrize(
+    ("capability", "model"),
+    [
+        ("fast", "haiku"),
+        ("balanced", "sonnet"),
+        ("strong", "opus"),
+    ],
+)
+def test_translate_claude_capability_uses_versionless_model_alias(
+    capability, model
+):
+    assert translate_behavior("claude", {"capability": capability}) == {
+        "model": model
+    }
 
 
 def test_translate_claude_tools_invocation_and_visibility():
